@@ -1,0 +1,148 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "RotorTree",
+  "projectDescription": "A high-performance n-ary lean incremental Merkle tree implementation with optional persistence for Rust",
+  "theme": "aspen",
+  "primaryColor": "#d40404",
+  "lightColor": "#e37c7c",
+  "darkColor": "#d4042c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/lean-imt",
+              "concepts/tree-structure",
+              "concepts/storage-modes"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/in-memory-tree",
+              "guides/persistent-storage",
+              "guides/proof-generation",
+              "guides/feature-flags",
+              "guides/tuning-performance"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/wal-checkpointing",
+              "advanced/memory-tiering",
+              "advanced/concurrency",
+              "advanced/parallelization"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Types",
+            "pages": [
+              "api/lean-imt",
+              "api/rotor-tree",
+              "api/tree-snapshot"
+            ]
+          },
+          {
+            "group": "Hashing",
+            "pages": [
+              "api/hasher",
+              "api/tree-hasher",
+              "api/blake3-hasher"
+            ]
+          },
+          {
+            "group": "Proofs",
+            "pages": [
+              "api/nary-proof",
+              "api/consistency-proof",
+              "api/proof-level"
+            ]
+          },
+          {
+            "group": "Storage",
+            "pages": [
+              "api/rotor-tree-config",
+              "api/flush-policy",
+              "api/checkpoint-policy",
+              "api/tiering-config",
+              "api/durability-token"
+            ]
+          },
+          {
+            "group": "Errors",
+            "pages": [
+              "api/tree-error",
+              "api/storage-error"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Performance",
+        "groups": [
+          {
+            "group": "Benchmarks",
+            "pages": [
+              "benchmarks/overview",
+              "benchmarks/in-memory",
+              "benchmarks/storage",
+              "benchmarks/concurrent"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "optimization/configuration",
+              "optimization/branching-factor",
+              "optimization/batch-operations"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "N-ary lean incremental Merkle tree with configurable branching factor",
+    "In-memory mode with optional concurrency and parallelization",
+    "Persistent storage with Write-Ahead Log (WAL) and checkpointing",
+    "Memory-mapped storage tiering for cold data",
+    "Proof generation and verification with structural sharing",
+    "no_std support for embedded environments",
+    "High-performance batch operations with rayon parallelization"
+  ],
+  "publicApiSurface": [
+    "LeanIMT<H, N, MAX_DEPTH>",
+    "RotorTree<H, N, MAX_DEPTH>",
+    "TreeSnapshot<H, N, MAX_DEPTH>",
+    "TreeHasher<H>",
+    "Blake3Hasher",
+    "NaryProof<N, MAX_DEPTH>",
+    "ConsistencyProof<N, MAX_DEPTH>",
+    "ProofLevel<N>",
+    "RotorTreeConfig",
+    "FlushPolicy",
+    "CheckpointPolicy",
+    "TieringConfig",
+    "DurabilityToken",
+    "TreeError",
+    "StorageError"
+  ]
+}
