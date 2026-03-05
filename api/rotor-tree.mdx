@@ -153,7 +153,7 @@ Opens or creates a `RotorTree` at the given path. If data files from a previous 
 ```rust Example
 use rotortree::{
     RotorTree, RotorTreeConfig, FlushPolicy, CheckpointPolicy, TieringConfig,
-    adapters::blake3::Blake3Hasher,
+    Blake3Hasher,
 };
 use std::path::PathBuf;
 use std::time::Duration;

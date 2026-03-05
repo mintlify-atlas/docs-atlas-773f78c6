@@ -52,13 +52,13 @@ Creates a new empty tree with the given hasher.
 
 <CodeGroup>
 ```rust Binary Tree
-use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+use rotortree::{LeanIMT, Blake3Hasher};
 
 let tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
 ```
 
 ```rust Ternary Tree
-use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+use rotortree::{LeanIMT, Blake3Hasher};
 
 let tree = LeanIMT::<Blake3Hasher, 3, 32>::new(Blake3Hasher);
 ```
@@ -91,7 +91,7 @@ Inserts a single leaf and returns the new Merkle root.
 - `TreeError::CapacityExceeded` if the tree size would overflow `u64`
 
 ```rust Example
-use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+use rotortree::{LeanIMT, Blake3Hasher};
 
 let mut tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
 let leaf = [0u8; 32];

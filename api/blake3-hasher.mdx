@@ -133,13 +133,14 @@ let leaf_hash = tree_hasher.hash_leaf(&some_hash);
 ### In a Tree
 
 ```rust
-use rotortree::{Tree, TreeHasher, Blake3Hasher};
+use rotortree::{LeanIMT, Blake3Hasher};
 
-let hasher = TreeHasher::new(Blake3Hasher::new());
-let mut tree = Tree::new(hasher, 4);
+// Create a tree with BLAKE3 hashing, N=4 branching, MAX_DEPTH=20
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
 
-// Tree uses BLAKE3 for all hash operations
-tree.insert(0, leaf_data)?;
+// Insert a prehashed leaf
+let leaf = [1u8; 32];
+let root = tree.insert(leaf)?;
 ```
 
 ## Performance Characteristics
