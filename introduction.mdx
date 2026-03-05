@@ -1,0 +1,79 @@
+---
+title: "Introduction"
+description: "High-performance n-ary lean incremental Merkle tree for Rust"
+---
+
+# RotorTree
+
+<Note>
+RotorTree is an experimental nullifier database building on first principles of architecting and specializing databases. This project makes **MANY** tradeoffs and is not suitable for production use.
+</Note>
+
+## What is RotorTree?
+
+RotorTree is a specialized database implementation focused on append-only n-ary Merkle trees. Unlike traditional privacy protocols that rely on general-purpose databases like RocksDB or PostgreSQL, RotorTree is designed from the ground up for high-throughput nullifier tracking.
+
+The tree design is heavily inspired by [lean-imt](https://zkkit.org/leanimt-paper.pdf) from PSE, adapted to an n-ary structure to reduce depth while maintaining the same total leaf capacity. This approach efficiently uses on-disk storage blocks by grouping leaves together.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Configurable Branching" icon="code-branch">
+    N-ary tree structure with configurable branching factor and max depth
+  </Card>
+  <Card title="Flexible Storage" icon="database">
+    Pure in-memory mode or persistent storage with WAL and checkpointing
+  </Card>
+  <Card title="Memory Tiering" icon="layer-group">
+    Pin hot levels in memory while cold levels use memory-mapped storage
+  </Card>
+  <Card title="High Performance" icon="rocket">
+    Peak throughput up to ~190M leaves/sec with parallel batch operations
+  </Card>
+  <Card title="Proof Generation" icon="shield-check">
+    Lock-free snapshots for concurrent proof generation and verification
+  </Card>
+  <Card title="no_std Support" icon="microchip">
+    Works in embedded environments without the standard library
+  </Card>
+</CardGroup>
+
+## Design Philosophy
+
+RotorTree makes specific tradeoffs optimized for its use case:
+
+- **Append-only**: No support for updating leaves in-place
+- **Prehashed leaves**: Assumes leaves are already hashed before insertion
+- **Generic hasher**: Blake3 by default, but supports any hasher implementation
+- **Batteries included**: Preconfigured for different branching factors and depths
+- **Minimal dependencies**: ~65 transitive dependencies, zero for just the algorithm
+
+<Warning>
+You should maintain a separate key-value database alongside RotorTree to prevent duplicate nullifier insertion. RotorTree does not perform this check internally.
+</Warning>
+
+## Capacity Examples
+
+With the right configuration, RotorTree can handle billions of nullifiers:
+
+- **N=4, MAX_DEPTH=16**: ~4.3B nullifiers in 41 GiB
+- **N=8, MAX_DEPTH=10**: ~1B nullifiers in 37 GiB
+
+For most use cases, keeping the tree in memory without crash persistence (with a bootstrapping sync mechanism) provides the best performance.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add RotorTree to your Rust project
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get started with your first tree
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand the architecture
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/lean-imt">
+    Explore the complete API
+  </Card>
+</CardGroup>

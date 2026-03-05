@@ -1,0 +1,334 @@
+---
+title: DurabilityToken
+description: Token for tracking when an insert has been durably fsynced to disk
+---
+
+`DurabilityToken` is returned from `RotorTree::insert()` and `insert_many()` to allow the caller to wait until the corresponding WAL entry has been fsynced to disk.
+
+## Definition
+
+Defined in `src/storage/token.rs:40`
+
+```rust
+pub struct DurabilityToken {
+    seq: u64,
+    inner: Arc<(Mutex<Option<u64>>, Condvar)>,
+}
+```
+
+<Note>
+  `DurabilityToken` is cheaply cloneable (contains only an `Arc`). Multiple threads can wait on the same token.
+</Note>
+
+## Methods
+
+### `wait()`
+
+Blocks the current thread until the WAL entry for this insert has been fsynced to disk.
+
+```rust
+pub fn wait(&self)
+```
+
+**Behavior:**
+- Blocks until the background flush thread (if using `FlushPolicy::Interval`) completes an fsync that includes this entry's sequence number
+- Returns immediately if already fsynced
+- Safe to call from multiple threads
+
+**Example:**
+
+```rust
+let (root, token) = tree.insert([42u8; 32])?;
+
+// Do other work...
+
+// Wait for durability
+token.wait();
+// Now guaranteed: insert is durable even if process crashes
+```
+
+### `is_durable()`
+
+Non-blocking check of whether the entry has been fsynced.
+
+```rust
+pub fn is_durable(&self) -> bool
+```
+
+**Returns:** `true` if fsynced, `false` otherwise.
+
+**Example:**
+
+```rust
+let (root, token) = tree.insert([42u8; 32])?;
+
+if token.is_durable() {
+    println!("Already durable");
+} else {
+    println!("Not yet fsynced");
+}
+```
+
+## Usage Patterns
+
+### Basic Wait Pattern
+
+```rust
+use rotortree::RotorTree;
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Insert and get token
+let (root, token) = tree.insert(leaf)?;
+
+// Wait for durability
+token.wait();
+
+// Safe to acknowledge to user
+Ok(root)
+```
+
+### Batch Insert with Durability
+
+```rust
+// Insert many leaves
+let leaves = vec![[1u8; 32]; 10_000];
+let (root, token) = tree.insert_many(&leaves)?;
+
+// Wait for entire batch to be durable
+token.wait();
+
+println!("All 10,000 leaves are durable");
+```
+
+### Async-Style Non-Blocking Check
+
+```rust
+use std::thread;
+use std::time::Duration;
+
+let (root, token) = tree.insert(leaf)?;
+
+// Poll for durability
+loop {
+    if token.is_durable() {
+        println!("Insert is now durable");
+        break;
+    }
+    
+    // Do other work
+    thread::sleep(Duration::from_millis(1));
+}
+```
+
+### Collect Multiple Tokens
+
+```rust
+use std::collections::VecDeque;
+
+let mut tokens = VecDeque::new();
+
+// Insert many entries
+for leaf in leaves {
+    let (_, token) = tree.insert(leaf)?;
+    tokens.push_back(token);
+}
+
+// Wait for all to be durable
+for token in tokens {
+    token.wait();
+}
+
+println!("All inserts durable");
+```
+
+### Manual Flush + Wait
+
+```rust
+use rotortree::FlushPolicy;
+
+// Using Manual flush policy
+let config = RotorTreeConfig {
+    flush_policy: FlushPolicy::Manual,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Insert many
+let mut tokens = vec![];
+for leaf in &leaves {
+    let (_, token) = tree.insert(*leaf)?;
+    tokens.push(token);
+}
+
+// Manually flush
+tree.flush()?;
+
+// Now all tokens will unblock immediately
+for token in tokens {
+    token.wait(); // Returns immediately
+}
+```
+
+## Durability Guarantees
+
+After `token.wait()` returns:
+
+<Check>
+  **Guaranteed:**
+  - The insert is written to the WAL file on disk
+  - The WAL file has been fsynced
+  - The insert will survive process crash, power loss, or system reboot
+  - The insert can be recovered from the WAL on next open
+</Check>
+
+<Warning>
+  **Not guaranteed:**
+  - The insert has been checkpointed (use `tree.checkpoint()` for that)
+  - Other inserts with later sequence numbers are durable (only this insert and earlier ones)
+</Warning>
+
+## Performance Considerations
+
+### Waiting on Every Insert (Slow)
+
+```rust
+// SLOW: Serial fsync for each insert
+for leaf in &leaves {
+    let (_, token) = tree.insert(*leaf)?;
+    token.wait(); // Blocks for fsync on each insert
+}
+
+// Throughput: ~100-1000 inserts/sec (limited by fsync latency)
+```
+
+### Batch Wait (Fast)
+
+```rust
+// FAST: Amortize fsync over many inserts
+let mut tokens = vec![];
+for leaf in &leaves {
+    let (_, token) = tree.insert(*leaf)?;
+    tokens.push(token);
+}
+
+// Wait for batch flush
+for token in tokens {
+    token.wait();
+}
+
+// Throughput: ~1M+ inserts/sec (limited by CPU, not fsync)
+```
+
+### `insert_durable()` Helper
+
+For single inserts that need immediate durability:
+
+```rust
+// Convenience method: insert + flush + wait
+let root = tree.insert_durable([42u8; 32])?;
+
+// Equivalent to:
+let (root, token) = tree.insert([42u8; 32])?;
+tree.flush()?;
+token.wait();
+```
+
+## Interaction with FlushPolicy
+
+### `FlushPolicy::Interval(Duration)`
+
+Background thread periodically fsyncs. Tokens wait for the next flush that includes their sequence number.
+
+```rust
+let config = RotorTreeConfig {
+    flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+let (_, token) = tree.insert(leaf)?;
+
+// Waits up to 10ms for next background flush
+token.wait();
+```
+
+**Latency:** Bounded by flush interval (e.g., ≤10ms).
+
+### `FlushPolicy::Manual`
+
+No automatic flushing. Tokens wait indefinitely until `tree.flush()` is called.
+
+```rust
+let config = RotorTreeConfig {
+    flush_policy: FlushPolicy::Manual,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+let (_, token) = tree.insert(leaf)?;
+
+// This would block forever without a flush:
+// token.wait();
+
+// Must manually flush:
+tree.flush()?;
+
+// Now token unblocks:
+token.wait(); // Returns immediately
+```
+
+## Common Patterns
+
+<CardGroup cols={2}>
+<Card title="Fire-and-Forget" icon="rocket">
+```rust
+// Don't wait, let background flush handle it
+let (root, _token) = tree.insert(leaf)?;
+// Continue immediately
+```
+Maximum throughput, eventual durability.
+</Card>
+
+<Card title="Sync Commit" icon="check">
+```rust
+// Wait for every insert
+let (root, token) = tree.insert(leaf)?;
+token.wait();
+```
+Maximum safety, lower throughput.
+</Card>
+
+<Card title="Batch Commit" icon="layer-group">
+```rust
+// Insert many, wait once
+let tokens: Vec<_> = leaves.iter()
+    .map(|leaf| tree.insert(*leaf).map(|(_, t)| t))
+    .collect::<Result<_, _>>()?;
+
+tree.flush()?;
+tokens.iter().for_each(|t| t.wait());
+```
+Balanced throughput and durability.
+</Card>
+
+<Card title="Best-Effort" icon="clock">
+```rust
+let (root, token) = tree.insert(leaf)?;
+
+// Check but don't block
+if !token.is_durable() {
+    println!("Warning: not yet durable");
+}
+```
+Non-blocking durability check.
+</Card>
+</CardGroup>
+
+## Related
+
+- [FlushPolicy](/api/flush-policy) - Controls when tokens unblock
+- [RotorTree::insert()](/api/rotor-tree#insert) - Returns a token
+- [RotorTree::insert_durable()](/api/rotor-tree#insert_durable) - Insert + wait helper
+- [RotorTree::flush()](/api/rotor-tree#flush) - Manual fsync trigger

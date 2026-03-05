@@ -1,0 +1,274 @@
+---
+title: TieringConfig
+description: Controls which tree levels are kept in memory vs mmap'd from disk
+---
+
+`TieringConfig` allows you to tier cold tree levels to memory-mapped data files after checkpoints, reducing memory usage for large trees while maintaining hot data in memory for fast access.
+
+## Definition
+
+Defined in `src/storage/checkpoint.rs:58`
+
+```rust
+pub struct TieringConfig {
+    /// Levels below this value have their committed chunks mmap'd after checkpoint.
+    /// Set to `usize::MAX` to mmap all levels (default), `0` to keep everything in memory
+    pub pin_above_level: usize,
+}
+```
+
+## Fields
+
+<ParamField path="pin_above_level" type="usize" required>
+  Controls the memory/disk boundary:
+  
+  - **Levels ≥ `pin_above_level`**: Kept in memory (hot data)
+  - **Levels < `pin_above_level`**: mmap'd from disk files after checkpoint (cold data)
+  
+  **Special values:**
+  - `0` - Keep everything in memory (no mmap)
+  - `usize::MAX` - mmap all levels (default, minimum memory)
+  
+  **Typical values:**
+  - `0-2` - Keep top 2 levels in memory (recent inserts hot)
+  - `3-5` - Moderate tiering
+  - `usize::MAX` - Maximum memory savings
+</ParamField>
+
+## How Tiering Works
+
+### Tree Level Structure
+
+In an n-ary tree with branching factor N:
+- **Level 0**: Leaf level (largest, coldest)
+- **Level 1**: First parent level
+- **Level 2+**: Higher parent levels
+- **Top level**: Root (smallest, hottest)
+
+<Note>
+  Higher level numbers = closer to root = smaller size = hotter access patterns.
+  
+  Level 0 (leaves) is the largest and least frequently accessed.
+</Note>
+
+### Memory vs Mmap
+
+After a checkpoint:
+
+```
+pin_above_level = 2
+
+    Level 4 (root)      ← In memory (4 ≥ 2)
+    Level 3             ← In memory (3 ≥ 2)
+    Level 2             ← In memory (2 ≥ 2)
+    Level 1             ← mmap'd (1 < 2)
+    Level 0 (leaves)    ← mmap'd (0 < 2)
+```
+
+Writes always go to memory. On checkpoint, levels below `pin_above_level` are remapped to mmap'd files.
+
+## Usage Examples
+
+### Default: Maximize Memory Savings
+
+```rust
+use rotortree::TieringConfig;
+
+let config = RotorTreeConfig {
+    // ...
+    tiering: TieringConfig::default(), // pin_above_level = usize::MAX
+    // ...
+};
+
+// All checkpointed levels are mmap'd
+// Minimum memory usage
+```
+
+### Keep Everything in Memory
+
+```rust
+use rotortree::TieringConfig;
+
+let config = RotorTreeConfig {
+    // ...
+    tiering: TieringConfig { pin_above_level: 0 },
+    // ...
+};
+
+// Nothing is mmap'd
+// Maximum performance, maximum memory usage
+```
+
+### Hybrid: Hot Levels in Memory
+
+```rust
+use rotortree::TieringConfig;
+
+let config = RotorTreeConfig {
+    // ...
+    tiering: TieringConfig { pin_above_level: 2 },
+    // ...
+};
+
+// Levels 0 and 1 are mmap'd (cold)
+// Levels ≥ 2 stay in memory (hot)
+// Good balance for large trees
+```
+
+## Memory Usage Examples
+
+<Note>
+  Each chunk is 128 hashes × 32 bytes = 4 KiB.
+  
+  Level sizes decrease by factor of N at each level.
+</Note>
+
+### N=4, MAX_DEPTH=16, 1B Leaves
+
+Approximate level sizes:
+
+```
+Level  0: ~32 GiB  (leaves)
+Level  1: ~8 GiB
+Level  2: ~2 GiB
+Level  3: ~512 MiB
+Level  4: ~128 MiB
+Level  5: ~32 MiB
+Level 6+: <32 MiB total
+```
+
+Tiering options:
+
+| `pin_above_level` | Memory Usage | mmap'd Size | Profile |
+|-------------------|--------------|-------------|----------|
+| `0` | ~43 GiB | 0 | All memory |
+| `1` | ~11 GiB | ~32 GiB | Hot path in memory |
+| `2` | ~3 GiB | ~40 GiB | Balanced |
+| `3` | ~700 MiB | ~42 GiB | Minimal memory |
+| `usize::MAX` | &lt;100 MiB | ~43 GiB | Maximum savings |
+
+### N=8, MAX_DEPTH=10, 1B Leaves
+
+Approximate level sizes:
+
+```
+Level 0: ~32 GiB  (leaves)
+Level 1: ~4 GiB
+Level 2: ~512 MiB
+Level 3: ~64 MiB
+Level 4+: <64 MiB total
+```
+
+Higher branching factors concentrate data in lower levels.
+
+## Performance Characteristics
+
+### Read Performance
+
+| Data Location | Access Latency | Throughput |
+|---------------|----------------|------------|
+| In-memory | ~10-50ns | Maximum |
+| mmap (hot page cache) | ~100-500ns | High |
+| mmap (cold, SSD) | ~10-100µs | Medium |
+| mmap (cold, HDD) | ~5-10ms | Low |
+
+<Tip>
+  The OS page cache keeps frequently accessed mmap'd pages in RAM. After warmup, mmap performance approaches in-memory performance for hot data.
+</Tip>
+
+### Write Performance
+
+Writes always go to in-memory WAL buffer first, so tiering doesn't affect write latency. Impact is only on checkpoint operations.
+
+## Choosing `pin_above_level`
+
+<CardGroup cols={2}>
+<Card title="Small Trees (<100M leaves)" icon="database">
+**Recommendation:** `pin_above_level = 0`
+
+Keep everything in memory. Memory usage is reasonable and performance is maximized.
+</Card>
+
+<Card title="Medium Trees (100M-1B leaves)" icon="server">
+**Recommendation:** `pin_above_level = 2`
+
+Balance memory and performance. Top levels hot, bottom levels cold.
+</Card>
+
+<Card title="Large Trees (>1B leaves)" icon="hard-drive">
+**Recommendation:** `pin_above_level = 3` or `usize::MAX`
+
+Minimize memory usage. Rely on OS page cache for frequently accessed data.
+</Card>
+
+<Card title="Proof Generation Workload" icon="magnifying-glass">
+**Recommendation:** `pin_above_level = 1` or `2`
+
+Proof generation reads from all levels. Keeping upper levels hot improves latency.
+</Card>
+</CardGroup>
+
+## Monitoring Memory Usage
+
+Monitor actual memory usage with OS tools:
+
+```bash
+# Linux: Check process RSS
+ps aux | grep rotortree
+
+# macOS: Check memory
+top -pid <PID>
+
+# Detailed memory map
+pmap <PID>
+```
+
+## Caveats
+
+<Warning>
+  - **mmap is not available on all platforms**: Windows support varies
+  - **File handle limits**: Each shard file requires a file handle
+  - **Page cache pressure**: Large mmap'd regions can evict other cached data
+  - **Checkpoint overhead**: Remapping levels adds latency to checkpoint operations
+</Warning>
+
+## Default Value
+
+```rust
+impl Default for TieringConfig {
+    fn default() -> Self {
+        Self {
+            pin_above_level: usize::MAX, // mmap everything
+        }
+    }
+}
+```
+
+## Shard Files
+
+After checkpointing, data files are organized as:
+
+```
+data/
+├── header.bin
+├── checkpoint.meta
+├── tails.bin
+├── level_0/
+│   ├── shard_0000.dat
+│   ├── shard_0001.dat
+│   └── ...
+├── level_1/
+│   ├── shard_0000.dat
+│   └── ...
+└── level_2/
+    └── ...
+```
+
+Each shard file contains up to 65,536 chunks (256 MiB).
+
+## Related
+
+- [CheckpointPolicy](/api/checkpoint-policy) - When tiering remapping occurs
+- [RotorTreeConfig](/api/rotor-tree-config) - Full configuration structure
+- [Tree Structure](/concepts/tree-structure) - Understanding tree levels
+- [Performance Tuning](/guides/tuning-performance) - Optimization strategies

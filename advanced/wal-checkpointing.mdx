@@ -1,0 +1,476 @@
+---
+title: "Write-Ahead Log & Checkpointing"
+description: "Deep dive into RotorTree's WAL structure, framing protocol, checkpoint policies, and crash recovery"
+---
+
+## Overview
+
+RotorTree implements durability through a write-ahead log (WAL) combined with periodic checkpointing. This design provides:
+
+- **Immediate durability** – Insertions are fsynced to the WAL before returning
+- **Fast recovery** – Replay only uncommitted WAL entries after a checkpoint
+- **Zero-copy deserialization** – WAL entries use `wincode` for efficient frame parsing
+- **Memory efficiency** – Checkpoints allow WAL truncation and mmap-backed storage
+
+## WAL Frame Structure
+
+Every WAL entry is written as a **framed record** with CRC32 integrity checking:
+
+```
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│  Length (4B) │  Payload     │  CRC32 (4B)  │              │
+│   varint     │   (N bytes)  │   checksum   │  Next frame  │
+└──────────────┴──────────────┴──────────────┴──────────────┘
+```
+
+The frame format provides:
+- **Corruption detection** – CRC32 over length + payload
+- **Truncation resilience** – Partial writes at tail are safely ignored
+- **Sequential append** – No random access required during recovery
+
+### Frame Implementation
+
+Frames are serialized using the `wincode` schema:
+
+```rust
+#[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
+enum WalEntry<'a> {
+    V1(WalEntryV1<'a>),
+}
+
+#[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
+struct WalEntryV1<'a> {
+    seq: u64,
+    payload: WalPayload<'a>,
+}
+
+#[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
+enum WalPayload<'a> {
+    Single(Hash),           // 32 bytes
+    Batch(NewCow<'a>),     // Vec<Hash> or &[Hash]
+}
+```
+
+Key design decisions:
+
+- **Sequence numbers** – Every entry has a monotonic `seq` for gap detection (src/storage/wal.rs:50)
+- **Cow semantics** – Batch payloads avoid allocation during serialization (src/storage/wal.rs:21-24)
+- **Versioned enums** – Future WAL format changes won't break existing data
+
+## WAL Header
+
+The WAL file begins with a header containing tree configuration:
+
+```rust
+#[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
+enum WalHeader {
+    V1 {
+        magic: [u8; 4],      // "ROTR" (0x52 0x4F 0x54 0x52)
+        n: u32,              // Branching factor
+        max_depth: u32,      // Maximum tree depth
+    },
+}
+```
+
+This is validated on open to detect configuration mismatches (src/storage/wal.rs:70-84).
+
+<Note>
+  If you change the branching factor `N` or `MAX_DEPTH`, you must delete the existing WAL or create a new data directory.
+</Note>
+
+## Checkpoint Policies
+
+Checkpointing materializes the in-memory tree state to disk, allowing WAL truncation. Choose a policy based on your workload:
+
+```rust
+pub enum CheckpointPolicy {
+    /// Manual checkpoints via explicit `checkpoint()` calls
+    Manual,
+    
+    /// Auto-checkpoint every N WAL entries
+    EveryNEntries(u64),
+    
+    /// Auto-checkpoint when uncommitted data exceeds N bytes
+    MemoryThreshold(usize),
+    
+    /// Checkpoint only when `close()` is called
+    OnClose,
+}
+```
+
+Defined in src/storage/checkpoint.rs:40-50.
+
+### Policy Selection Guide
+
+<AccordionGroup>
+  <Accordion title="Manual – Full Control">
+    **Use when:**
+    - You want deterministic checkpoint timing
+    - Coordinating with application-level transactions
+    - Running benchmarks or tests
+
+    **Trade-offs:**
+    - WAL grows unbounded until explicit checkpoint
+    - Recovery time increases with WAL size
+  </Accordion>
+
+  <Accordion title="EveryNEntries – Predictable Recovery">
+    **Use when:**
+    - You want bounded recovery time (max N entries to replay)
+    - Write rate is relatively uniform
+    - Prefer simple tuning knobs
+
+    **Tuning:**
+    ```rust
+    CheckpointPolicy::EveryNEntries(10_000)  // ~10k insertions between checkpoints
+    ```
+
+    **Trade-offs:**
+    - May checkpoint too frequently if batch insertions are large
+  </Accordion>
+
+  <Accordion title="MemoryThreshold – Bounded Memory">
+    **Use when:**
+    - Write sizes vary dramatically (mix of single/batch inserts)
+    - You want to cap uncommitted memory usage
+    - Running with limited RAM
+
+    **Tuning:**
+    ```rust
+    CheckpointPolicy::MemoryThreshold(64 * 1024 * 1024)  // 64 MB threshold
+    ```
+
+    **Implementation:**
+    Tracks `uncheckpointed_memory_bytes` atomically (src/storage/mod.rs:129, 541-542, 578-580).
+  </Accordion>
+
+  <Accordion title="OnClose – Minimal Overhead">
+    **Use when:**
+    - Tree is short-lived or batch-processed
+    - Recovery time on restart is acceptable
+    - Want zero checkpoint overhead during operation
+
+    **Trade-offs:**
+    - Entire WAL must be replayed on recovery
+    - No disk space reclaimed until close
+  </Accordion>
+</AccordionGroup>
+
+## Checkpoint Workflow
+
+Checkpoints run on a background thread (src/storage/mod.rs:753-791):
+
+```rust
+1. Flush WAL buffer and fsync
+2. Capture tree snapshot (depth, leaf_count, root_hash, level data)
+3. For each level:
+   - Write new chunks to shard files (level_N/shard_XXXX.dat)
+   - Fsync shard files
+4. Write tails.bin (partial chunks)
+5. Write checkpoint.meta atomically (last_wal_seq, root_hash, etc.)
+6. Remap committed chunks to mmap if tiering.pin_above_level allows
+7. Truncate WAL to header only
+8. Signal completion via condvar
+```
+
+Key invariants:
+
+- **Atomicity** – `checkpoint.meta` is written last using atomic rename (src/storage/checkpoint.rs:158-169)
+- **Idempotency** – Partial checkpoint can be safely retried
+- **Snapshot isolation** – Insertions continue on the tree while checkpoint runs
+
+### Checkpoint Thread Lifecycle
+
+The checkpoint thread waits on a condvar and wakes when:
+1. Auto-checkpoint threshold is met (src/storage/mod.rs:388-394)
+2. Manual `checkpoint()` is called
+3. Tree is closing (src/storage/mod.rs:656-664)
+
+Implementation (src/storage/mod.rs:766-787):
+
+```rust
+loop {
+    let mut coord = lock.lock();
+    while !coord.requested && !shared.closed.load(Ordering::Acquire) {
+        cvar.wait(&mut coord);  // Block until signaled
+    }
+    if shared.closed.load(Ordering::Acquire) {
+        break;  // Exit thread
+    }
+    coord.requested = false;
+    drop(coord);
+    
+    if let Err(e) = shared.checkpoint_inner() {
+        // Store error, stop background checkpoints
+        shared.bg_error.store(Arc::new(Some(
+            BackgroundError::CheckpointFailed(e.to_string())
+        )));
+        break;
+    }
+}
+```
+
+<Warning>
+  If a checkpoint fails, all subsequent operations will return the checkpoint error. The tree enters a read-only error state.
+</Warning>
+
+## Shard Files
+
+Each tree level's committed chunks are stored in **shard files**:
+
+```
+data/
+  level_0/
+    shard_0000.dat  (chunks 0..65535)
+    shard_0001.dat  (chunks 65536..131071)
+  level_1/
+    shard_0000.dat
+```
+
+Constants (src/storage/checkpoint.rs:29-30):
+
+```rust
+const CHUNK_BYTE_SIZE: usize = CHUNK_SIZE * 32;  // 128 * 32 = 4096 bytes
+const CHUNKS_PER_SHARD: usize = 65_536;          // 256 MB per shard
+```
+
+**Why shard?**
+
+- **mmap limits** – Some systems limit mmap size; sharding stays under limits
+- **Partial mmap** – Can mmap only hot shards if tiering is configured
+- **Parallel writes** – Multiple shards can be written concurrently (future optimization)
+
+### Shard Addressing
+
+```rust
+pub(crate) fn shard_address(chunk_idx: usize) -> (usize, usize) {
+    let shard_idx = chunk_idx / CHUNKS_PER_SHARD;
+    let offset_in_shard = (chunk_idx % CHUNKS_PER_SHARD) * CHUNK_BYTE_SIZE;
+    (shard_idx, offset_in_shard)
+}
+```
+
+Defined in src/storage/checkpoint.rs:33-38.
+
+## Recovery Process
+
+On `RotorTree::open()`, recovery happens in two phases:
+
+### Phase 1: Checkpoint Recovery
+
+If `data/checkpoint.meta` exists:
+
+```rust
+1. Read and validate checkpoint.meta (CRC32)
+2. Extract last_wal_seq, leaf_count, depth, root_hash
+3. Read tails.bin (partial chunks for each level)
+4. For each level:
+   - Compute expected chunk count from leaf_count
+   - mmap shard files
+   - Reconstruct ChunkedLevel from (mmap_chunks, tail, tail_len)
+5. Optionally recompute root hash to verify integrity (verify_checkpoint=true)
+```
+
+Implementation in src/storage/recovery.rs (not shown but referenced in src/storage/mod.rs:465-473).
+
+<Info>
+  **Verification overhead:** Recomputing the root hash requires hashing every node in the tree. Only enable `verify_checkpoint` if you suspect disk corruption.
+</Info>
+
+### Phase 2: WAL Replay
+
+After loading the checkpoint (or from empty state):
+
+```rust
+1. Read WAL header, validate magic and config
+2. Scan frames sequentially from header_end to EOF
+3. For each frame:
+   - Validate CRC32
+   - Check seq == last_seq + 1 (detect gaps)
+   - Apply insertion to TreeInner
+4. On truncation or CRC error at tail:
+   - Assume partial write, stop replay
+5. Set next_seq for future insertions
+```
+
+Gap detection (src/storage/wal.rs:112-116):
+
+```rust
+if let Some(last) = last_seq
+    && v1.seq != last.checked_add(1).ok_or(StorageError::MathError)?
+{
+    return Ok(None);  // Gap found, stop replay
+}
+```
+
+**Why stop on gaps?**
+
+A sequence gap indicates either:
+- Partial write that was never fsynced (safe to ignore)
+- Corruption (tail CRC check failed earlier)
+- File was manually truncated
+
+Stopping at the first gap ensures we only replay durable, ordered entries.
+
+## Flush Policies
+
+WAL writes are buffered in memory and flushed based on `FlushPolicy`:
+
+```rust
+pub enum FlushPolicy {
+    /// Fsync every N milliseconds (default: 10ms)
+    Interval(Duration),
+    
+    /// Manual flushing via `flush()`
+    Manual,
+}
+```
+
+Defined in src/storage/mod.rs:70-82.
+
+### Flush Thread
+
+With `FlushPolicy::Interval(duration)`, a background thread runs (src/storage/mod.rs:728-751):
+
+```rust
+loop {
+    let mut stop = lock.lock();
+    cvar.wait_for(&mut stop, duration);  // Sleep for duration
+    if *stop {
+        break;  // Shutdown requested
+    }
+    drop(stop);
+    let _ = shared.flush_inner();  // Fsync buffered WAL
+}
+```
+
+**Performance consideration:**
+
+- 10ms interval ≈ 100 flushes/sec max throughput
+- Increase interval for higher batch throughput, lower durability guarantee
+- Use `Manual` for custom flush logic (e.g., flush on commit)
+
+### Durability Tokens
+
+Insertions return a `DurabilityToken` that you can `.wait()` on:
+
+```rust
+let (root, token) = tree.insert(leaf)?;
+// Leaf is in WAL buffer, but not fsynced yet
+
+tree.flush()?;  // Force fsync
+token.wait();   // Block until this insertion is durable
+```
+
+Or use `insert_durable()` which flushes and waits automatically (src/storage/mod.rs:592-596).
+
+## Crash Consistency
+
+RotorTree guarantees:
+
+1. **No data loss** – All fsynced WAL entries are replayed on recovery
+2. **No corruption** – CRC32 detects any partial writes or bit flips
+3. **Consistent state** – Tree is always in a valid state after recovery (root hash matches tree contents)
+
+**Not guaranteed:**
+
+- Entries in the WAL buffer (not fsynced) are lost on crash
+- If `checkpoint.meta` write partially succeeds, recovery falls back to full WAL replay
+
+### Atomic Writes
+
+Critical files use atomic write-rename (src/storage/checkpoint.rs:355-370):
+
+```rust
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;  // Fsync file contents
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        dir.sync_all()?;  // Fsync directory entry
+    }
+    Ok(())
+}
+```
+
+This ensures that `checkpoint.meta`, `header.bin`, and `tails.bin` are either fully written or not visible.
+
+<Note>
+  On some filesystems (e.g., ext4 with `data=writeback`), directory fsync may not provide full durability. Consider using `data=ordered` or `data=journal` for mission-critical deployments.
+</Note>
+
+## Monitoring Checkpoint Activity
+
+You can block until a checkpoint completes:
+
+```rust
+use std::time::Duration;
+
+// Wait up to 5 seconds for the next checkpoint
+let completed = tree.wait_for_checkpoint(Duration::from_secs(5));
+if !completed {
+    eprintln!("Checkpoint did not complete in time");
+}
+```
+
+Implementation (src/storage/mod.rs:632-646):
+
+```rust
+pub fn wait_for_checkpoint(&self, timeout: Duration) -> bool {
+    let (lock, cvar) = &self.shared.checkpoint;
+    let mut coord = lock.lock();
+    let initial = coord.completed;  // Checkpoint counter
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if coord.completed > initial {
+            return true;  // Checkpoint finished
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;  // Timeout
+        }
+        cvar.wait_for(&mut coord, remaining);
+    }
+}
+```
+
+This is useful for testing or coordinating shutdown.
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="High Throughput" icon="gauge-high">
+    - Use `CheckpointPolicy::MemoryThreshold(256_MB)`
+    - Set `FlushPolicy::Interval(50ms)` for batching
+    - Call `insert_many()` instead of `insert()` in loops
+  </Card>
+  
+  <Card title="Low Latency" icon="bolt">
+    - Use `insert_durable()` for immediate fsync
+    - Set `FlushPolicy::Interval(1ms)` or `Manual`
+    - Checkpoint frequently to keep recovery fast
+  </Card>
+  
+  <Card title="Memory Constrained" icon="microchip">
+    - Use `CheckpointPolicy::MemoryThreshold(32_MB)`
+    - Enable memory tiering (see [memory-tiering](/advanced/memory-tiering))
+    - Monitor `uncheckpointed_memory_bytes` counter
+  </Card>
+  
+  <Card title="Fast Recovery" icon="rotate-right">
+    - Use `CheckpointPolicy::EveryNEntries(1000)`
+    - Keep WAL small (frequent checkpoints)
+    - Disable `verify_checkpoint` for faster startup
+  </Card>
+</CardGroup>
+
+## Related Topics
+
+- [Memory Tiering](/advanced/memory-tiering) – How checkpoints enable mmap-backed storage
+- [Concurrency](/advanced/concurrency) – Lock-free snapshots during checkpoint
+- [Storage Architecture](/advanced/wal-checkpointing) – Overall storage design

@@ -1,0 +1,325 @@
+---
+title: 'ConsistencyProof'
+description: 'Consistency proof that one tree is a prefix of another'
+---
+
+## Overview
+
+`ConsistencyProof<N, MAX_DEPTH>` proves that a tree of `old_size` leaves is a prefix of a tree of `new_size` leaves, meaning the older tree's structure and hashes are preserved in the larger tree.
+
+## Type Definition
+
+```rust
+pub struct ConsistencyProof<const N: usize, const MAX_DEPTH: usize> {
+    pub old_root: Hash,
+    pub new_root: Hash,
+    pub old_size: u64,
+    pub new_size: u64,
+    pub level_count: usize,
+    pub levels: [ConsistencyLevel<N>; MAX_DEPTH],
+}
+```
+
+## Generic Parameters
+
+<ParamField path="N" type="const usize">
+  The branching factor (arity) of the tree. Must be the same for both old and new trees.
+</ParamField>
+
+<ParamField path="MAX_DEPTH" type="const usize">
+  The maximum depth of the tree. Determines the maximum tree sizes that can be proven.
+</ParamField>
+
+## Fields
+
+<ParamField path="old_root" type="Hash">
+  Root of the old (smaller) tree. A `Hash` is a 32-byte array (`[u8; 32]`).
+</ParamField>
+
+<ParamField path="new_root" type="Hash">
+  Root of the new (larger) tree.
+</ParamField>
+
+<ParamField path="old_size" type="u64">
+  Number of leaves in the old tree. Must be ≤ `new_size`.
+</ParamField>
+
+<ParamField path="new_size" type="u64">
+  Number of leaves in the new tree. Must be ≥ `old_size`.
+</ParamField>
+
+<ParamField path="level_count" type="usize">
+  Number of valid levels in the `levels` array. Only `levels[..level_count]` are used during verification.
+</ParamField>
+
+<ParamField path="levels" type="[ConsistencyLevel<N>; MAX_DEPTH]">
+  Proof levels from leaves toward root. Each level contains shared and new-only hashes needed to reconstruct both roots.
+</ParamField>
+
+## Derive Traits
+
+- `Debug`
+- `Clone`
+- `PartialEq`
+- `Eq`
+- `wincode::SchemaWrite` (with `wincode` feature)
+- `wincode::SchemaRead` (with `wincode` feature)
+- `serde::Serialize` (with `serde` feature)
+- `serde::Deserialize` (with `serde` feature)
+
+## Methods
+
+### verify
+
+```rust
+pub fn verify<H: Hasher>(&self, hasher: &TreeHasher<H>) -> Result<bool, TreeError>
+```
+
+Verify this consistency proof against the given hasher. Returns `Ok(true)` if both reconstructed roots match.
+
+**Validation checks:**
+- Both tree sizes must be non-zero
+- `old_size` must be ≤ `new_size`
+- `level_count` must not exceed `MAX_DEPTH`
+- Level count must match expected depth
+- Shared and new-only counts at each level must be correct
+
+**Example:**
+
+```rust
+use rotortree::{LeanIMT, XorHasher, TreeHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+let old_snapshot = tree.snapshot();
+let old_root = old_snapshot.root().unwrap();
+
+tree.insert([3u8; 32]).unwrap();
+tree.insert([4u8; 32]).unwrap();
+let new_snapshot = tree.snapshot();
+
+let proof = new_snapshot.generate_consistency_proof(2, old_root).unwrap();
+
+let hasher = TreeHasher::new(XorHasher);
+assert!(proof.verify(&hasher).unwrap());
+```
+
+### verify_against
+
+```rust
+pub fn verify_against<H: Hasher>(
+    &self,
+    hasher: &TreeHasher<H>,
+    trusted_old_root: Hash,
+    trusted_new_root: Hash,
+) -> Result<bool, TreeError>
+```
+
+Verify this consistency proof against externally-trusted roots. First checks that both roots match the trusted values, then verifies the proof.
+
+**Example:**
+
+```rust
+let proof = new_snapshot.generate_consistency_proof(2, old_root).unwrap();
+
+let hasher = TreeHasher::new(XorHasher);
+assert!(proof.verify_against(&hasher, old_root, new_root).unwrap());
+```
+
+### verify_transition
+
+```rust
+pub fn verify_transition<H: Hasher>(
+    &self,
+    hasher: &TreeHasher<H>,
+    trusted_old_root: Hash,
+) -> Result<bool, TreeError>
+```
+
+Verify this consistency proof against a trusted old root. If verification succeeds, the caller can trust `self.new_root`.
+
+This is useful when you have a previously trusted root and want to verify that a new root is a valid extension.
+
+**Example:**
+
+```rust
+// We trust the old root from a previous verification
+let trusted_old_root = old_snapshot.root().unwrap();
+
+// Verify that the new tree is a valid extension
+let proof = new_snapshot.generate_consistency_proof(2, trusted_old_root).unwrap();
+let hasher = TreeHasher::new(XorHasher);
+
+if proof.verify_transition(&hasher, trusted_old_root).unwrap() {
+    // We can now trust proof.new_root
+    println!("New root is valid: {:?}", proof.new_root);
+}
+```
+
+### update_inclusion_proof
+
+```rust
+pub fn update_inclusion_proof<H: Hasher>(
+    &self,
+    old_proof: &NaryProof<N, MAX_DEPTH>,
+    hasher: &TreeHasher<H>,
+) -> Result<NaryProof<N, MAX_DEPTH>, TreeError>
+```
+
+Update an existing inclusion proof from `old_root` to `new_root`.
+
+Given a valid `NaryProof` for some leaf against `old_root`, produces a valid `NaryProof` for the same leaf against `new_root` using only the data in this consistency proof.
+
+This is highly efficient as it doesn't require access to the full tree data.
+
+**Example:**
+
+```rust
+use rotortree::{LeanIMT, XorHasher, TreeHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+let old_snapshot = tree.snapshot();
+let old_root = old_snapshot.root().unwrap();
+
+// Generate proof for leaf 0 in old tree
+let old_proof = old_snapshot.generate_proof(0).unwrap();
+
+// Add more leaves
+tree.insert([3u8; 32]).unwrap();
+tree.insert([4u8; 32]).unwrap();
+let new_snapshot = tree.snapshot();
+
+// Generate consistency proof
+let consistency_proof = new_snapshot
+    .generate_consistency_proof(2, old_root)
+    .unwrap();
+
+// Update the old inclusion proof to work with the new tree
+let hasher = TreeHasher::new(XorHasher);
+let updated_proof = consistency_proof
+    .update_inclusion_proof(&old_proof, &hasher)
+    .unwrap();
+
+// Verify the updated proof against the new root
+assert!(updated_proof.verify(&hasher).unwrap());
+assert_eq!(updated_proof.root, new_snapshot.root().unwrap());
+assert_eq!(updated_proof.leaf, old_proof.leaf);
+assert_eq!(updated_proof.leaf_index, old_proof.leaf_index);
+```
+
+**Error cases:**
+- `old_proof.root != self.old_root` → `TreeError::MathError`
+- Consistency proof doesn't verify → `TreeError::MathError`
+- `old_proof.leaf_index >= self.old_size` → `TreeError::IndexOutOfRange`
+- `old_size == new_size` → `TreeError::NoUpdateNeeded`
+
+## Generating Consistency Proofs
+
+Consistency proofs are generated from a `TreeSnapshot` using the `generate_consistency_proof` method:
+
+```rust
+let new_snapshot = tree.snapshot();
+let proof = new_snapshot.generate_consistency_proof(old_size, old_root)?;
+```
+
+See [TreeSnapshot](/api/tree-snapshot#generate_consistency_proof) for details.
+
+## Serialization
+
+### With `wincode` feature
+
+```rust
+use rotortree::ConsistencyProof;
+
+let proof: ConsistencyProof<2, 32> = /* ... */;
+let bytes = wincode::serialize(&proof)?;
+let decoded: ConsistencyProof<2, 32> = wincode::deserialize(&bytes)?;
+```
+
+### With `serde` feature
+
+```rust
+use rotortree::ConsistencyProof;
+
+let proof: ConsistencyProof<2, 32> = /* ... */;
+let json = serde_json::to_string(&proof)?;
+let decoded: ConsistencyProof<2, 32> = serde_json::from_str(&json)?;
+```
+
+## Use Cases
+
+### Certificate Transparency
+
+Consistency proofs are essential for Certificate Transparency logs, where clients need to verify that logs are append-only and haven't been tampered with.
+
+```rust
+// Client has seen tree at size 1000 with root_1000
+// Server claims tree now has size 2000 with root_2000
+// Server provides consistency proof
+
+let proof = /* received from server */;
+let hasher = TreeHasher::new(XorHasher);
+
+if proof.verify_transition(&hasher, root_1000).unwrap() {
+    // Server hasn't rewritten history
+    // Trust the new root
+    let root_2000 = proof.new_root;
+}
+```
+
+### Efficient Proof Updates
+
+Clients can keep old inclusion proofs and update them as the tree grows:
+
+```rust
+// Client stores proof for their certificate at index 42
+let mut my_proof = old_snapshot.generate_proof(42).unwrap();
+
+// Tree grows; client receives consistency proof
+let consistency = new_snapshot.generate_consistency_proof(
+    old_size,
+    old_root
+).unwrap();
+
+// Update the old proof without downloading the whole tree
+my_proof = consistency.update_inclusion_proof(&my_proof, &hasher).unwrap();
+```
+
+## Error Cases
+
+Verification returns `Err(TreeError)` if:
+
+- `old_size == 0` or `new_size == 0` → `TreeError::MathError`
+- `old_size > new_size` → `TreeError::MathError`
+- `level_count > MAX_DEPTH` → `TreeError::MathError`
+- `level_count` doesn't match expected depth → `TreeError::InvalidProofDepth`
+- Shared or new counts don't match expected values → `TreeError::MathError`
+
+Verification returns `Ok(false)` if:
+
+- The reconstructed old or new root doesn't match the claimed roots
+- The proof has been tampered with
+
+## Special Cases
+
+### Same Size Trees
+
+When `old_size == new_size`, the consistency proof is trivial with `level_count = 0`. Verification simply checks that both roots match.
+
+```rust
+let proof = snapshot.generate_consistency_proof(
+    snapshot.size(),
+    snapshot.root().unwrap()
+).unwrap();
+assert_eq!(proof.level_count, 0);
+assert_eq!(proof.old_root, proof.new_root);
+```
+
+## See Also
+
+- [NaryProof](/api/nary-proof) - Inclusion proof structure
+- [ProofLevel](/api/proof-level) - Individual proof level for inclusion proofs
+- [TreeSnapshot](/api/tree-snapshot) - Proof generation methods

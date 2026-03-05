@@ -1,0 +1,284 @@
+---
+title: 'TreeSnapshot'
+description: 'Immutable snapshot for lock-free proof generation'
+---
+
+## Type Definition
+
+```rust
+pub struct TreeSnapshot<const N: usize, const MAX_DEPTH: usize>
+```
+
+An immutable snapshot of a Merkle tree at a specific point in time. Snapshots support lock-free proof generation and share structure with the source tree via `Arc`.
+
+### Generic Parameters
+
+<ParamField path="N" type="usize" required>
+  Branching factor matching the source tree
+</ParamField>
+
+<ParamField path="MAX_DEPTH" type="usize" required>
+  Maximum depth matching the source tree
+</ParamField>
+
+## Methods
+
+### root
+
+```rust
+pub fn root(&self) -> Option<Hash>
+```
+
+Returns the Merkle root of this snapshot, or `None` if the tree was empty.
+
+<ResponseField name="return" type="Option<Hash>">
+  The 32-byte root hash
+</ResponseField>
+
+```rust Example
+let snapshot = tree.snapshot();
+if let Some(root) = snapshot.root() {
+    println!("Snapshot root: {:?}", root);
+}
+```
+
+### size
+
+```rust
+pub fn size(&self) -> u64
+```
+
+Returns the number of leaves in this snapshot.
+
+<ResponseField name="return" type="u64">
+  The leaf count
+</ResponseField>
+
+```rust Example
+let count = snapshot.size();
+println!("Snapshot has {} leaves", count);
+```
+
+### depth
+
+```rust
+pub fn depth(&self) -> usize
+```
+
+Returns the depth of this snapshot (number of hash layers above the leaf level).
+
+<ResponseField name="return" type="usize">
+  The tree depth
+</ResponseField>
+
+```rust Example
+let d = snapshot.depth();
+println!("Snapshot depth: {}", d);
+```
+
+### level_len
+
+```rust
+pub fn level_len(&self, level: usize) -> usize
+```
+
+Returns the number of nodes at the given level.
+
+<ParamField path="level" type="usize" required>
+  The level index (0 = leaf level)
+</ParamField>
+
+<ResponseField name="return" type="usize">
+  Number of nodes at that level, or 0 if level > depth
+</ResponseField>
+
+```rust Example
+for level in 0..=snapshot.depth() {
+    println!("Level {}: {} nodes", level, snapshot.level_len(level));
+}
+```
+
+### get_node
+
+```rust
+pub fn get_node(&self, level: usize, index: usize) -> Result<Hash, TreeError>
+```
+
+Retrieves the hash of a specific node by level and index.
+
+<ParamField path="level" type="usize" required>
+  The level index (0 = leaf level)
+</ParamField>
+
+<ParamField path="index" type="usize" required>
+  The node index within that level
+</ParamField>
+
+<ResponseField name="return" type="Result<Hash, TreeError>">
+  The 32-byte node hash
+</ResponseField>
+
+**Errors:**
+- `TreeError::IndexOutOfRange` if the level or index is invalid
+
+```rust Example
+// Get the third leaf
+let leaf = snapshot.get_node(0, 2)?;
+
+// Get the first node at level 1
+let parent = snapshot.get_node(1, 0)?;
+```
+
+### generate_proof
+
+```rust
+pub fn generate_proof(
+    &self,
+    leaf_index: u64,
+) -> Result<NaryProof<N, MAX_DEPTH>, TreeError>
+```
+
+Generates an inclusion proof for the leaf at the given index.
+
+<ParamField path="leaf_index" type="u64" required>
+  The 0-based index of the leaf to prove
+</ParamField>
+
+<ResponseField name="return" type="Result<NaryProof<N, MAX_DEPTH>, TreeError>">
+  An inclusion proof containing the root, leaf, and sibling hashes at each level
+</ResponseField>
+
+**Errors:**
+- `TreeError::IndexOutOfRange` if `leaf_index >= size`
+
+```rust Example
+use rotortree::TreeHasher;
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(42)?;
+
+// Verify the proof
+let hasher = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&hasher)?);
+```
+
+<Info>
+Proof generation is lock-free and can run concurrently with tree modifications. Each snapshot represents a consistent point-in-time view.
+</Info>
+
+### generate_consistency_proof
+
+```rust
+pub fn generate_consistency_proof(
+    &self,
+    old_size: u64,
+    old_root: Hash,
+) -> Result<ConsistencyProof<N, MAX_DEPTH>, TreeError>
+```
+
+Generates a consistency proof showing that a tree of `old_size` leaves with `old_root` is a prefix of this snapshot.
+
+<ParamField path="old_size" type="u64" required>
+  The number of leaves in the old tree
+</ParamField>
+
+<ParamField path="old_root" type="Hash" required>
+  The root hash of the old tree
+</ParamField>
+
+<ResponseField name="return" type="Result<ConsistencyProof<N, MAX_DEPTH>, TreeError>">
+  A consistency proof demonstrating the append-only property
+</ResponseField>
+
+**Errors:**
+- `TreeError::IndexOutOfRange` if `old_size == 0`, `old_size > size`, or `size == 0`
+
+```rust Example
+// Capture two states
+let snapshot1 = tree.snapshot();
+let root1 = snapshot1.root().unwrap();
+let size1 = snapshot1.size();
+
+// Insert more leaves
+for i in 0..100 {
+    tree.insert([i as u8; 32])?;
+}
+
+let snapshot2 = tree.snapshot();
+
+// Prove that snapshot1 is a prefix of snapshot2
+let consistency = snapshot2.generate_consistency_proof(size1, root1)?;
+
+let hasher = TreeHasher::new(Blake3Hasher);
+assert!(consistency.verify(&hasher)?);
+```
+
+<Note>
+Consistency proofs are critical for verifiable append-only logs. Clients can verify that new snapshots extend old ones without recomputing the entire tree.
+</Note>
+
+## Usage Patterns
+
+### Lock-Free Concurrent Reads
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+let tree = Arc::new(LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher));
+
+// Writer thread
+let tree_w = Arc::clone(&tree);
+let writer = thread::spawn(move || {
+    for i in 0..1000 {
+        tree_w.insert([i as u8; 32]).unwrap();
+    }
+});
+
+// Reader threads take snapshots and generate proofs
+let handles: Vec<_> = (0..4)
+    .map(|_| {
+        let tree = Arc::clone(&tree);
+        thread::spawn(move || {
+            let snapshot = tree.snapshot();
+            let size = snapshot.size();
+            if size > 0 {
+                for i in 0..size {
+                    let _ = snapshot.generate_proof(i);
+                }
+            }
+        })
+    })
+    .collect();
+
+writer.join().unwrap();
+for h in handles {
+    h.join().unwrap();
+}
+```
+
+### Maintaining Historical Snapshots
+
+```rust
+let mut snapshots = Vec::new();
+
+for i in 0..100 {
+    tree.insert([i as u8; 32])?;
+    if i % 10 == 0 {
+        snapshots.push(tree.snapshot());
+    }
+}
+
+// All snapshots remain valid
+for (i, snap) in snapshots.iter().enumerate() {
+    println!("Snapshot {}: {} leaves", i, snap.size());
+}
+```
+
+<Info>
+Snapshots use copy-on-write semantics with `Arc`-based structural sharing. Creating many snapshots adds minimal memory overhead—only the small metadata structure is cloned.
+</Info>
+
+## Proof Verification
+
+See [NaryProof](/api/nary-proof) and [ConsistencyProof](/api/consistency-proof) for details on verifying proofs generated from snapshots.

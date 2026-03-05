@@ -1,0 +1,204 @@
+---
+title: 'Architecture Overview'
+description: 'High-level architecture of RotorTree: an n-ary lean incremental Merkle tree with structural sharing and persistent storage'
+---
+
+## Core Design
+
+RotorTree is a specialized database for append-only Merkle trees, built from first principles for high-throughput privacy protocols. It implements an **n-ary lean incremental Merkle tree (Lean IMT)** with structural sharing and optional persistent storage.
+
+<Note>
+The design is inspired by [lean-imt](https://zkkit.org/leanimt-paper.pdf) by cedoor & vivian @ PSE, but extends it to support n-ary trees (not just binary) and adds sophisticated storage tiering.
+</Note>
+
+## Key Components
+
+RotorTree consists of three main layers:
+
+### 1. Tree Algorithm Layer (`LeanIMT`)
+
+The core in-memory tree implementation:
+
+- **Type**: `LeanIMT<H: Hasher, const N: usize, const MAX_DEPTH: usize>`
+- **Branching Factor**: Compile-time constant `N` (must be ≥ 2)
+- **Max Depth**: Compile-time constant `MAX_DEPTH` (must be ≥ 1)
+- **Features**:
+  - Single-threaded by default (`&mut self` methods)
+  - Optional `concurrent` feature (internal `RwLock` for `&self` methods)
+  - Optional `parallel` feature (Rayon-parallelized batch insertions)
+  - Generic hasher (Blake3 by default)
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher};
+
+// N=4 branching factor, MAX_DEPTH=20
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+let root = tree.insert([1u8; 32]).unwrap();
+```
+
+### 2. Storage Layer (`RotorTree`)
+
+Optional persistence via Write-Ahead Log (WAL) and checkpointing:
+
+- **WAL**: Buffered writes with configurable flush policies
+- **Checkpointing**: Materializes tree state to data files, enables WAL truncation
+- **Recovery**: Replays WAL on startup, optionally verifies root hash
+- **Durability Tokens**: Allows tracking when writes are fsynced
+
+```rust
+use rotortree::{RotorTree, RotorTreeConfig, Blake3Hasher};
+use std::path::PathBuf;
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+    checkpoint_policy: CheckpointPolicy::Manual,
+    tiering: TieringConfig::default(),
+    verify_checkpoint: true,
+};
+
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config)?;
+let (root, token) = tree.insert([42u8; 32])?;
+token.wait(); // Block until fsynced
+```
+
+### 3. Proof Generation Layer
+
+Lock-free snapshots for proof generation:
+
+- **Inclusion Proofs**: `NaryProof<N, MAX_DEPTH>`
+- **Consistency Proofs**: `ConsistencyProof<N, MAX_DEPTH>`
+- **Proof Updates**: Update old proofs to new tree states
+- **Serialization**: Optional `serde` and `wincode` support
+
+```rust
+let snap = tree.snapshot();
+let proof = snap.generate_proof(0)?;
+assert!(proof.verify(&TreeHasher::new(Blake3Hasher))?);  
+```
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Application Layer                       │
+│  insert(), insert_many(), snapshot(), checkpoint()          │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+         ┌───────────────┴───────────────┐
+         │                               │
+         ▼                               ▼
+┌─────────────────┐            ┌─────────────────────┐
+│   LeanIMT       │            │    RotorTree        │
+│  (in-memory)    │            │   (persistent)      │
+│                 │            │                     │
+│ • ChunkedLevel  │            │ • WAL buffering     │
+│ • Structural    │            │ • Flush thread      │
+│   sharing       │            │ • Checkpoint thread │
+│ • Snapshots     │            │ • Recovery logic    │
+└────────┬────────┘            └──────────┬──────────┘
+         │                                │
+         │                                ▼
+         │                     ┌──────────────────────┐
+         │                     │   Storage Files      │
+         │                     │                      │
+         │                     │ • wal (append-only)  │
+         │                     │ • data/level_N/      │
+         │                     │   shard_XXXX.dat     │
+         │                     │ • checkpoint.meta    │
+         │                     │ • tails.bin          │
+         │                     └──────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│         Proof Generation                │
+│                                         │
+│ TreeSnapshot → generate_proof()         │
+│             → generate_consistency()    │
+└─────────────────────────────────────────┘
+```
+
+## Design Principles
+
+<AccordionGroup>
+  <Accordion title="Append-Only Operations">
+    RotorTree only supports appending new leaves. There is no in-place update or deletion. This simplifies the design and enables efficient structural sharing.
+    
+    <Warning>
+    You should maintain a separate key-value database to prevent duplicate nullifier insertions.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Generic Hashing">
+    The tree is generic over the hasher type. Blake3 is the default, but you can use any hasher that implements the `Hasher` trait.
+    
+    Assumptions:
+    - Leaves are pre-hashed (32-byte values)
+    - Partial support for RFC 6962 for internal nodes
+    - You should constrain node values to your finite field before insertion
+  </Accordion>
+
+  <Accordion title="No Standard Library by Default">
+    The core algorithm is `no_std` compatible. Only the `storage` feature requires `std`.
+  </Accordion>
+
+  <Accordion title="Minimal Dependencies">
+    Approximately 65 dependencies (active + transitive, excluding dev deps). The core algorithm has zero dependencies.
+  </Accordion>
+</AccordionGroup>
+
+## Performance Characteristics
+
+### Throughput
+
+- **Single-threaded**: Best performance characteristic in terms of variance, useful when predictability under load is a constraint
+- **Parallel (with `parallel` feature)**: Up to ~190M leaves/sec peak throughput
+- **Trade-off**: Performance vs. predictability
+
+### Capacity Examples
+
+With persistent storage and tiering:
+
+- **N=4, MAX_DEPTH=16**: ~4.3B nullifiers in 41 GiB
+- **N=8, MAX_DEPTH=10**: ~1B nullifiers in 37 GiB
+
+<Info>
+In most cases, you just need the tree in memory without crash persistence (as long as there is a bootstrapping sync mechanism). Use the single-threaded variant for better performance with low insertion rates.
+</Info>
+
+## Tuning Parameters
+
+### Compile-Time Constants
+
+Defined in `src/tree.rs`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CHUNK_SIZE` | 128 | Hashes per chunk for structural sharing. 128 × 32 bytes = 4 KB per chunk |
+| `CHUNKS_PER_SEGMENT` | 256 | Chunks per immutable segment. Controls Arc slab size |
+| `PAR_CHUNK_SIZE` | 64 | Parents per rayon work unit (with `parallel` feature) |
+| `MAX_FRAME_PAYLOAD` | 128 MB | Maximum WAL/checkpoint frame payload size |
+
+### Runtime Environment Variables
+
+- `ROTORTREE_PARALLEL_THRESHOLD` (default: 1024): Minimum parent count before rayon parallelism kicks in (with `parallel` feature)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Lean IMT Design" icon="tree" href="./lean-imt">
+    Learn about the n-ary lean incremental Merkle tree algorithm
+  </Card>
+  
+  <Card title="Tree Structure" icon="diagram-project" href="./tree-structure">
+    Understand structural sharing with chunks and segments
+  </Card>
+  
+  <Card title="Storage Modes" icon="database" href="./storage-modes">
+    Explore in-memory vs. persistent storage with tiering
+  </Card>
+  
+  <Card title="Proof Generation" icon="shield-check" href="../features/proof-generation">
+    Generate and verify inclusion and consistency proofs
+  </Card>
+</CardGroup>

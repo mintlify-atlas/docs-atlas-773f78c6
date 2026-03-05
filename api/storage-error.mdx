@@ -1,0 +1,405 @@
+---
+title: StorageError & RotorTreeError
+description: Storage, I/O, and unified error types
+---
+
+## Overview
+
+RotorTree defines two error types for persistent storage operations:
+
+- **`StorageError`** - Errors from WAL and storage operations
+- **`RotorTreeError`** - Unified error type combining tree and storage errors
+
+## StorageError
+
+`StorageError` represents errors that occur during persistence operations, including I/O failures, corruption detection, and concurrency issues.
+
+```rust
+pub enum StorageError {
+    Io(std::io::Error),
+    CrcMismatch { offset: u64, expected: u32, actual: u32 },
+    WalCorrupted { offset: u64 },
+    ConfigMismatch { 
+        expected_n: u32, 
+        actual_n: u32, 
+        expected_max_depth: u32, 
+        actual_max_depth: u32 
+    },
+    FileLocked,
+    Closed,
+    Tree(TreeError),
+    FlushFailed(Arc<std::io::Error>),
+    CheckpointFailed(String),
+    MathError,
+    DataCorruption { detail: String },
+    SerdeFailed { path: String },
+}
+```
+
+### Error Variants
+
+<Accordion title="Io">
+  **Returned when:** An I/O operation fails.
+  
+  ```rust
+  StorageError::Io(std::io::Error)
+  ```
+  
+  Wraps standard library I/O errors from file operations.
+  
+  **Common causes:**
+  - Permission denied
+  - Disk full
+  - File not found
+  - Network filesystem issues
+  
+  **Recovery strategy:**
+  - Check filesystem permissions
+  - Verify available disk space
+  - Retry with exponential backoff for transient errors
+</Accordion>
+
+<Accordion title="CrcMismatch">
+  **Returned when:** CRC32C checksum verification fails at a given offset.
+  
+  ```rust
+  StorageError::CrcMismatch { 
+      offset: u64, 
+      expected: u32, 
+      actual: u32 
+  }
+  ```
+  
+  Indicates data corruption was detected during WAL recovery.
+  
+  **Common causes:**
+  - Disk corruption
+  - Partial write due to crash
+  - Hardware failure
+  - Bit rot
+  
+  **Recovery strategy:**
+  - Restore from backup
+  - WAL is automatically truncated to last valid frame
+  - Check hardware health
+</Accordion>
+
+<Accordion title="WalCorrupted">
+  **Returned when:** WAL file is corrupted at the given offset (not a tail truncation).
+  
+  ```rust
+  StorageError::WalCorrupted { offset: u64 }
+  ```
+  
+  Indicates structural corruption beyond simple incomplete writes.
+  
+  **Common causes:**
+  - File tampering
+  - Severe disk corruption
+  - Bug in WAL writer
+  
+  **Recovery strategy:**
+  - Restore from backup
+  - Data after corruption point is lost
+</Accordion>
+
+<Accordion title="ConfigMismatch">
+  **Returned when:** WAL file header has different N or MAX_DEPTH than expected.
+  
+  ```rust
+  StorageError::ConfigMismatch {
+      expected_n: u32,
+      actual_n: u32,
+      expected_max_depth: u32,
+      actual_max_depth: u32,
+  }
+  ```
+  
+  The tree configuration doesn't match the persisted data.
+  
+  **Common causes:**
+  - Changing tree parameters between runs
+  - Opening wrong WAL file
+  - Using incompatible tree types
+  
+  **Recovery strategy:**
+  - Use correct type parameters matching the WAL
+  - Migrate data to new configuration if needed
+</Accordion>
+
+<Accordion title="FileLocked">
+  **Returned when:** Another process holds an exclusive lock on the WAL file.
+  
+  ```rust
+  StorageError::FileLocked
+  ```
+  
+  Only one process can open a WAL file at a time.
+  
+  **Common causes:**
+  - Another instance already running
+  - Previous process didn't exit cleanly
+  - Stale lock file
+  
+  **Recovery strategy:**
+  - Ensure no other instances are running
+  - Wait for lock to be released
+  - Clean up stale processes
+</Accordion>
+
+<Accordion title="Closed">
+  **Returned when:** Attempting operations on a closed tree.
+  
+  ```rust
+  StorageError::Closed
+  ```
+  
+  The tree has been explicitly closed and no further operations are allowed.
+  
+  **Common causes:**
+  - Using tree after `close()` was called
+  - Concurrent access during shutdown
+  
+  **Recovery strategy:**
+  - Don't use tree after closing
+  - Reopen tree if needed
+</Accordion>
+
+<Accordion title="Tree">
+  **Returned when:** A tree operation fails during WAL recovery.
+  
+  ```rust
+  StorageError::Tree(TreeError)
+  ```
+  
+  Wraps a `TreeError` that occurred while replaying the WAL.
+  
+  **Common causes:**
+  - Corrupted WAL entries
+  - Invalid operations recorded in WAL
+  - Replay logic bugs
+  
+  **Recovery strategy:**
+  - Check inner `TreeError` for specific issue
+  - May indicate WAL corruption
+</Accordion>
+
+<Accordion title="FlushFailed">
+  **Returned when:** The background flush thread encountered an I/O error.
+  
+  ```rust
+  StorageError::FlushFailed(Arc<std::io::Error>)
+  ```
+  
+  Asynchronous flushes failed in background thread.
+  
+  **Common causes:**
+  - Disk full during async flush
+  - I/O errors in background
+  - Filesystem issues
+  
+  **Recovery strategy:**
+  - Check disk space
+  - Review system logs
+  - Restart with clean state
+</Accordion>
+
+<Accordion title="CheckpointFailed">
+  **Returned when:** The background checkpoint thread encountered an error.
+  
+  ```rust
+  StorageError::CheckpointFailed(String)
+  ```
+  
+  Checkpointing operation failed in background.
+  
+  **Common causes:**
+  - I/O errors during checkpoint
+  - Filesystem issues
+  - Insufficient permissions
+  
+  **Recovery strategy:**
+  - Check error detail string
+  - Review filesystem health
+  - Verify permissions
+</Accordion>
+
+<Accordion title="MathError">
+  **Returned when:** An internal mathematical operation fails.
+  
+  ```rust
+  StorageError::MathError
+  ```
+  
+  Arithmetic error during storage operations.
+  
+  **Recovery strategy:**
+  - Report as a bug if encountered
+</Accordion>
+
+<Accordion title="DataCorruption">
+  **Returned when:** Data corruption is detected (e.g., root recomputation mismatch).
+  
+  ```rust
+  StorageError::DataCorruption { detail: String }
+  ```
+  
+  Semantic corruption detected during verification.
+  
+  **Common causes:**
+  - Corruption not caught by CRC
+  - Logic bugs in storage layer
+  - Hardware issues
+  
+  **Recovery strategy:**
+  - Restore from backup
+  - Check hardware health
+  - Review error detail for diagnostics
+</Accordion>
+
+<Accordion title="SerdeFailed">
+  **Returned when:** Frame deserialization failed despite valid CRC.
+  
+  ```rust
+  StorageError::SerdeFailed { path: String }
+  ```
+  
+  Valid checksum but incompatible schema or version.
+  
+  **Common causes:**
+  - Version mismatch between writer and reader
+  - Schema evolution issues
+  - Incompatible serialization format
+  
+  **Recovery strategy:**
+  - Use matching versions
+  - Migrate data if format changed
+</Accordion>
+
+## RotorTreeError
+
+`RotorTreeError` is the unified error type returned by high-level `RotorTree` operations. It combines both tree-level and storage-level errors.
+
+```rust
+pub enum RotorTreeError {
+    Tree(TreeError),
+    Storage(StorageError),
+}
+```
+
+### Variants
+
+- **`Tree(TreeError)`** - A tree-level error (depth exceeded, capacity, etc.)
+- **`Storage(StorageError)`** - A storage-level error (I/O, corruption, etc.)
+
+### Conversions
+
+`RotorTreeError` automatically converts from:
+
+```rust
+impl From<TreeError> for RotorTreeError { /* ... */ }
+impl From<StorageError> for RotorTreeError { /* ... */ }
+impl From<std::io::Error> for RotorTreeError { /* ... */ }
+```
+
+## Error Handling
+
+### Pattern Matching
+
+```rust
+use rotortree::{RotorTreeError, StorageError, TreeError};
+
+match tree.insert(leaf) {
+    Ok(()) => println!("Success"),
+    Err(RotorTreeError::Tree(TreeError::MaxDepthExceeded { max_depth })) => {
+        eprintln!("Tree full: max_depth={}", max_depth);
+    }
+    Err(RotorTreeError::Storage(StorageError::Io(e))) => {
+        eprintln!("I/O error: {}", e);
+        // Retry or fallback logic
+    }
+    Err(RotorTreeError::Storage(StorageError::Closed)) => {
+        eprintln!("Tree was closed");
+    }
+    Err(e) => eprintln!("Error: {}", e),
+}
+```
+
+### Handling Corruption
+
+```rust
+match RotorTree::open(path, config) {
+    Ok(tree) => tree,
+    Err(RotorTreeError::Storage(StorageError::CrcMismatch { offset, .. })) => {
+        eprintln!("Corruption detected at offset {}", offset);
+        eprintln!("WAL will be truncated to last valid frame");
+        // Tree will still open with data up to corruption point
+        return Err("Data loss detected".into());
+    }
+    Err(RotorTreeError::Storage(StorageError::ConfigMismatch { 
+        expected_n, actual_n, .. 
+    })) => {
+        eprintln!("Config mismatch: expected N={}, got {}", 
+                  expected_n, actual_n);
+        // Need to use correct type parameters
+        return Err("Configuration mismatch".into());
+    }
+    Err(e) => return Err(e.into()),
+}
+```
+
+### Handling Concurrency
+
+```rust
+use std::time::Duration;
+use std::thread;
+
+let max_retries = 5;
+let mut retries = 0;
+
+let tree = loop {
+    match RotorTree::open(path, config) {
+        Ok(tree) => break tree,
+        Err(RotorTreeError::Storage(StorageError::FileLocked)) => {
+            retries += 1;
+            if retries >= max_retries {
+                return Err("File locked after retries".into());
+            }
+            eprintln!("File locked, retrying... ({}/{})", retries, max_retries);
+            thread::sleep(Duration::from_millis(100 * retries));
+        }
+        Err(e) => return Err(e),
+    }
+};
+```
+
+### Graceful Degradation
+
+```rust
+// Try persistent tree first, fall back to in-memory
+let tree = match RotorTree::open(path, config) {
+    Ok(tree) => tree,
+    Err(RotorTreeError::Storage(e)) => {
+        eprintln!("Storage error: {}, using in-memory tree", e);
+        // Fall back to non-persistent tree
+        InMemoryTree::new(config)
+    }
+    Err(e) => return Err(e),
+};
+```
+
+## Traits
+
+Both error types implement:
+- `Debug` - for debugging output
+- `Display` - for user-friendly error messages  
+- `std::error::Error` - for error trait compatibility with `source()` support
+
+`StorageError` implements:
+- `From<std::io::Error>` - automatic conversion from I/O errors
+
+## See Also
+
+- [TreeError](/api/tree-error) - Core tree operation errors
+- [Persistent Storage](/guides/persistent-storage) - Persistence and WAL
+- [RotorTree API](/api/rotor-tree) - Storage configuration

@@ -1,80 +1,321 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get started with RotorTree in minutes
 ---
 
-## Get started in three steps
+This guide walks you through creating your first n-ary lean incremental Merkle tree, inserting leaves, and generating proofs.
 
-Get your documentation site running locally and make your first customization.
+## Basic In-Memory Tree
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Import dependencies">
+    ```rust
+    use rotortree::{LeanIMT, Blake3Hasher, TreeHasher};
+    ```
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+  <Step title="Create a tree">
+    Create a tree with N=4 branching factor and MAX_DEPTH=20:
+
+    ```rust
+    let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+    ```
+
+    <Note>
+      The branching factor (N) and maximum depth are compile-time constants. Choose values that match your capacity needs.
+    </Note>
+  </Step>
+
+  <Step title="Insert a single leaf">
+    ```rust
+    let leaf = [1u8; 32];
+    let root = tree.insert(leaf).unwrap();
+    println!("Root after insert: {:?}", root);
+    ```
+  </Step>
+
+  <Step title="Insert multiple leaves">
+    For batch insertions, use `insert_many`:
+
+    ```rust
+    let leaves: Vec<[u8; 32]> = (0..1000u32)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h
+        })
+        .collect();
+    let root = tree.insert_many(&leaves).unwrap();
+    ```
+
+    <Note>
+      `insert_many` is significantly faster than individual inserts, especially with the `parallel` feature enabled.
+    </Note>
+  </Step>
+
+  <Step title="Generate and verify a proof">
+    ```rust
+    // Take a snapshot for proof generation
+    let snap = tree.snapshot();
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    // Generate proof for leaf at index 0
+    let proof = snap.generate_proof(0).unwrap();
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    // Verify the proof
+    let th = TreeHasher::new(Blake3Hasher);
+    assert!(proof.verify(&th).unwrap());
+    println!("Proof verified successfully!");
+    ```
+  </Step>
+</Steps>
 
-### Step 2: Deploy your changes
+## Complete Example
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+Here's a complete working example:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher};
+
+fn main() {
+    // Create tree with N=4, MAX_DEPTH=20
+    let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    // Insert a single leaf
+    let leaf = [1u8; 32];
+    let root = tree.insert(leaf).unwrap();
+    
+    // Batch insert 1000 leaves
+    let leaves: Vec<[u8; 32]> = (0..1000u32)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h
+        })
+        .collect();
+    let root = tree.insert_many(&leaves).unwrap();
+    
+    // Generate and verify proof
+    let snap = tree.snapshot();
+    let proof = snap.generate_proof(0).unwrap();
+    let th = TreeHasher::new(Blake3Hasher);
+    assert!(proof.verify(&th).unwrap());
+    
+    println!("All operations completed successfully!");
+}
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+## Tree with Persistence
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+For production applications, enable WAL-backed persistence:
 
-### Step 3: Go live
+<Steps>
+  <Step title="Enable the storage feature">
+    ```toml Cargo.toml
+    [dependencies]
+    rotortree = { version = "0.15.0", features = ["storage"] }
+    ```
+  </Step>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+  <Step title="Configure and open the tree">
+    ```rust
+    use rotortree::{
+        Blake3Hasher, RotorTree, RotorTreeConfig, TreeHasher,
+        FlushPolicy, CheckpointPolicy, TieringConfig,
+    };
+    use std::path::PathBuf;
+    
+    let config = RotorTreeConfig {
+        path: PathBuf::from("/tmp/my-tree"),
+        flush_policy: FlushPolicy::default(), // fsync every 10ms
+        checkpoint_policy: CheckpointPolicy::default(), // manual
+        tiering: TieringConfig::default(), // all in memory
+        verify_checkpoint: true, // recompute root on recovery
+    };
+    
+    // Opens existing WAL or creates a new one
+    let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config).unwrap();
+    ```
+  </Step>
 
-## Next steps
+  <Step title="Insert with durability">
+    ```rust
+    // Insert and get a durability token
+    let (root, token) = tree.insert([42u8; 32]).unwrap();
+    token.wait(); // Blocks until the entry is fsynced
+    
+    // Or insert + wait for fsync in one call
+    let root = tree.insert_durable([43u8; 32]).unwrap();
+    ```
+  </Step>
 
-Now that you have your docs running, explore these key features:
+  <Step title="Generate proofs (same as in-memory)">
+    ```rust
+    // Lock-free snapshot
+    let snap = tree.snapshot();
+    let proof = snap.generate_proof(0).unwrap();
+    let th = TreeHasher::new(Blake3Hasher);
+    assert!(proof.verify(&th).unwrap());
+    ```
+  </Step>
 
-<CardGroup cols={2}>
+  <Step title="Graceful shutdown">
+    ```rust
+    tree.flush().unwrap();
+    tree.close().unwrap();
+    // (also flushes + releases file lock on drop)
+    ```
+  </Step>
+</Steps>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+## Configuration Options
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+### Flush Policies
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+<CodeGroup>
+```rust Interval (Background)
+FlushPolicy::Interval(Duration::from_millis(10))
+```
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+```rust Manual
+FlushPolicy::Manual
+// Caller controls flushing via tree.flush()
+// Works well if you're following a blockchain as canonical source
+```
+</CodeGroup>
 
-</CardGroup>
+### Checkpoint Policies
+
+Checkpointing materializes WAL state to data files and allows WAL truncation:
+
+<CodeGroup>
+```rust Manual
+CheckpointPolicy::Manual
+// Caller calls checkpoint() explicitly
+```
+
+```rust Every N Entries
+CheckpointPolicy::EveryNEntries(1000)
+// Auto-checkpoint after every 1000 WAL entries
+```
+
+```rust Memory Threshold
+CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024)
+// Auto-checkpoint when uncheckpointed memory exceeds 256 MiB
+```
+
+```rust On Close
+CheckpointPolicy::OnClose
+// Checkpoint only on graceful close
+```
+</CodeGroup>
+
+### Tiering Configuration
+
+Control which tree levels stay in memory vs get memory-mapped:
+
+```rust
+// Keep everything in memory (best performance)
+TieringConfig { pin_above_level: 0 }
+
+// Memory-map everything after checkpoint (minimal memory)
+TieringConfig { pin_above_level: usize::MAX } // default
+
+// Memory-map levels below 5
+TieringConfig { pin_above_level: 5 }
+```
+
+## Advanced: Light Client Consistency Proofs
+
+RotorTree supports efficient consistency proofs for light clients. Here's how a light client can track an inclusion proof without transferring all leaves:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher, ConsistencyProof};
+
+// Bootstrap: receive initial leaves from full node
+let mut tree = LeanIMT::<Blake3Hasher, 4, 14>::new(Blake3Hasher);
+tree.insert_many(&initial_leaves).unwrap();
+let snap = tree.snapshot();
+let mut tracked_proof = snap.generate_proof(tracked_leaf_index).unwrap();
+
+// Later: receive consistency proof for new batch
+let old_size = snap.size();
+let old_root = snap.root().unwrap();
+
+// ... (full node inserts more leaves and generates consistency proof)
+
+// Verify the tree transition
+let th = TreeHasher::new(Blake3Hasher);
+assert!(consistency_proof.verify_transition(&th, old_root).unwrap());
+
+// Update the tracked inclusion proof WITHOUT receiving new leaves
+let updated_proof = consistency_proof
+    .update_inclusion_proof(&tracked_proof, &th)
+    .unwrap();
+
+assert!(updated_proof.verify(&th).unwrap());
+tracked_proof = updated_proof;
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  For a complete working example, see `examples/light_client.rs` in the repository.
 </Note>
+
+## Performance Tips
+
+<CardGroup cols={2}>
+  <Card title="Use parallel for large batches" icon="bolt">
+    Enable the `parallel` feature and use `insert_many` for batches of 1000+ leaves.
+  </Card>
+  
+  <Card title="Tune branching factor" icon="sitemap">
+    Higher N reduces depth but increases node size. N=4 or N=8 works well for most cases.
+  </Card>
+  
+  <Card title="Manual flush for blockchain" icon="database">
+    Use `FlushPolicy::Manual` and flush after each block to align with your consensus layer.
+  </Card>
+  
+  <Card title="Memory-map for large trees" icon="hard-drive">
+    Use `TieringConfig::pin_above_level` to tier cold levels to disk when trees exceed available RAM.
+  </Card>
+</CardGroup>
+
+## Important Design Considerations
+
+<Warning>
+  RotorTree is a **research experiment** and makes many tradeoffs. It is **not suitable for production** as-is.
+</Warning>
+
+<CardGroup cols={1}>
+  <Card title="Nullifier Deduplication" icon="shield">
+    Use a separate key-value database to ensure you don't insert the same nullifier twice. RotorTree is append-only.
+  </Card>
+  
+  <Card title="Field Constraints" icon="calculator">
+    Constrain node values to your finite field before insertion if using in zero-knowledge circuits.
+  </Card>
+  
+  <Card title="Prehashed Leaves" icon="hashtag">
+    RotorTree assumes leaves are already hashed. It provides partial RFC 6962 support for internal nodes only.
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="book" href="/api/lean-imt">
+    Explore the complete API documentation
+  </Card>
+  
+  <Card title="Configuration" icon="sliders" href="/guides/tuning-performance">
+    Learn about tuning parameters and environment variables
+  </Card>
+  
+  <Card title="Examples" icon="code" href="https://github.com/rymnc/rotortree/tree/main/examples">
+    View complete example applications
+  </Card>
+  
+  <Card title="Benchmarks" icon="chart-line" href="https://rymnc.github.io/rotortree/benchmarks">
+    Review performance benchmarks (~380 benchmarks)
+  </Card>
+</CardGroup>

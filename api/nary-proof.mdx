@@ -1,0 +1,204 @@
+---
+title: 'NaryProof'
+description: 'N-ary Merkle inclusion proof structure'
+---
+
+## Overview
+
+`NaryProof<N, MAX_DEPTH>` is an N-ary Merkle inclusion proof that proves a specific leaf exists at a given index in a tree with a specific root hash.
+
+## Type Definition
+
+```rust
+pub struct NaryProof<const N: usize, const MAX_DEPTH: usize> {
+    pub root: Hash,
+    pub leaf: Hash,
+    pub leaf_index: u64,
+    pub tree_size: u64,
+    pub level_count: usize,
+    pub levels: [ProofLevel<N>; MAX_DEPTH],
+}
+```
+
+## Generic Parameters
+
+<ParamField path="N" type="const usize">
+  The branching factor (arity) of the tree. Common values are 2 (binary), 3 (ternary), 4 (quaternary).
+</ParamField>
+
+<ParamField path="MAX_DEPTH" type="const usize">
+  The maximum depth of the tree. Determines the maximum tree size that can be proven.
+</ParamField>
+
+## Fields
+
+<ParamField path="root" type="Hash">
+  The Merkle root this proof verifies against. A `Hash` is a 32-byte array (`[u8; 32]`).
+</ParamField>
+
+<ParamField path="leaf" type="Hash">
+  The leaf hash being proved.
+</ParamField>
+
+<ParamField path="leaf_index" type="u64">
+  The 0-based index of the leaf in the tree.
+</ParamField>
+
+<ParamField path="tree_size" type="u64">
+  Number of leaves in the tree this proof was generated from.
+</ParamField>
+
+<ParamField path="level_count" type="usize">
+  Number of valid levels in the `levels` array. Only `levels[..level_count]` are used during verification.
+</ParamField>
+
+<ParamField path="levels" type="[ProofLevel<N>; MAX_DEPTH]">
+  Proof levels from leaf to root. Each level contains the sibling hashes needed to reconstruct the parent hash at that level.
+</ParamField>
+
+## Derive Traits
+
+- `Debug`
+- `Clone`
+- `PartialEq`
+- `Eq`
+- `wincode::SchemaWrite` (with `wincode` feature)
+- `wincode::SchemaRead` (with `wincode` feature)
+- `serde::Serialize` (with `serde` feature)
+- `serde::Deserialize` (with `serde` feature)
+
+## Methods
+
+### verify
+
+```rust
+pub fn verify<H: Hasher>(&self, hasher: &TreeHasher<H>) -> Result<bool, TreeError>
+```
+
+Verify this proof against the given hasher. Returns `Ok(true)` if the proof is valid.
+
+**Validation checks:**
+- Tree size must be non-zero
+- Leaf index must be less than tree size
+- Level count must match expected depth for the tree size
+- Level count must not exceed `MAX_DEPTH`
+- Each level's position must match the expected position based on the leaf index
+- Sibling counts must be valid
+
+**Example:**
+
+```rust
+use rotortree::{LeanIMT, XorHasher, TreeHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(0).unwrap();
+
+let hasher = TreeHasher::new(XorHasher);
+assert!(proof.verify(&hasher).unwrap());
+```
+
+### verify_against
+
+```rust
+pub fn verify_against<H: Hasher>(
+    &self,
+    hasher: &TreeHasher<H>,
+    trusted_root: Hash,
+) -> Result<bool, TreeError>
+```
+
+Verify this inclusion proof against an externally-trusted root. First checks that the proof's root matches the trusted root, then verifies the proof.
+
+**Example:**
+
+```rust
+use rotortree::{LeanIMT, XorHasher, TreeHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(0).unwrap();
+let trusted_root = snapshot.root().unwrap();
+
+let hasher = TreeHasher::new(XorHasher);
+assert!(proof.verify_against(&hasher, trusted_root).unwrap());
+```
+
+## Generating Proofs
+
+Proofs are generated from a `TreeSnapshot` using the `generate_proof` method:
+
+```rust
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(leaf_index)?;
+```
+
+See [TreeSnapshot](/api/tree-snapshot#generate_proof) for details.
+
+## Serialization
+
+### With `wincode` feature
+
+```rust
+use rotortree::NaryProof;
+
+let proof: NaryProof<2, 32> = /* ... */;
+let bytes = wincode::serialize(&proof)?;
+let decoded: NaryProof<2, 32> = wincode::deserialize(&bytes)?;
+```
+
+### With `serde` feature
+
+```rust
+use rotortree::NaryProof;
+
+let proof: NaryProof<2, 32> = /* ... */;
+let json = serde_json::to_string(&proof)?;
+let decoded: NaryProof<2, 32> = serde_json::from_str(&json)?;
+```
+
+## Verification Workflow
+
+1. **Generate proof**: Create a snapshot and call `generate_proof(leaf_index)`
+2. **Transmit proof**: Serialize and send the proof to a verifier
+3. **Verify proof**: Deserialize and call `verify()` or `verify_against()`
+4. **Interpret result**: `Ok(true)` means the leaf exists at the claimed index with the claimed root
+
+```rust
+// Prover side
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(3)?;
+let bytes = wincode::serialize(&proof)?;
+
+// Verifier side
+let proof: NaryProof<2, 32> = wincode::deserialize(&bytes)?;
+let hasher = TreeHasher::new(XorHasher);
+let valid = proof.verify(&hasher)?;
+assert!(valid);
+```
+
+## Error Cases
+
+Verification returns `Err(TreeError)` if:
+
+- `tree_size == 0` or `leaf_index >= tree_size` → `TreeError::MathError`
+- `level_count` doesn't match expected depth → `TreeError::InvalidProofDepth`
+- `level_count > MAX_DEPTH` → `TreeError::InvalidProofDepth`
+- Position or sibling count validation fails → `TreeError::MathError`
+
+Verification returns `Ok(false)` if:
+
+- The reconstructed root doesn't match `self.root`
+- The proof has been tampered with
+
+## See Also
+
+- [ProofLevel](/api/proof-level) - Individual proof level structure
+- [ConsistencyProof](/api/consistency-proof) - Proof that one tree is a prefix of another
+- [TreeSnapshot](/api/tree-snapshot) - Proof generation methods

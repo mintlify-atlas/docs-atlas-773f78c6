@@ -1,0 +1,188 @@
+---
+title: FlushPolicy
+description: Controls when buffered WAL entries are fsynced to disk
+---
+
+`FlushPolicy` determines the durability guarantees for insertions by controlling when buffered write-ahead log entries are fsynced to disk.
+
+## Definition
+
+Defined in `src/storage/mod.rs:70`
+
+```rust
+pub enum FlushPolicy {
+    /// Fsync on a periodic interval (default: 10ms)
+    Interval(Duration),
+    /// Caller controls flushing via `flush()`
+    Manual,
+}
+```
+
+## Variants
+
+### `Interval(Duration)`
+
+A background thread periodically fsyncs the WAL buffer at the specified interval.
+
+**Default:** `Duration::from_millis(10)`
+
+<ParamField path="Duration" type="std::time::Duration" required>
+  Time interval between fsync operations.
+  
+  **Common values:**
+  - `10ms` - Default, good balance of throughput and durability
+  - `1ms` - Lower latency, higher overhead
+  - `100ms` - Higher throughput, longer recovery window
+</ParamField>
+
+**Tradeoffs:**
+- Shorter intervals = lower durability latency, higher CPU overhead
+- Longer intervals = higher throughput, larger recovery window
+
+**Use when:**
+- You want automatic durability without managing flushes
+- Acceptable to lose up to `interval` worth of writes on crash
+- Trading off some durability for better throughput
+
+### `Manual`
+
+The application controls when to fsync by calling `tree.flush()` explicitly.
+
+**No automatic flushing occurs.** Insertions are buffered in memory until:
+- Application calls `flush()`
+- Tree checkpoint occurs (flushes before checkpointing)
+- Tree is closed (flushes on graceful shutdown)
+
+**Use when:**
+- You have natural flush points (e.g., after each blockchain block)
+- You want maximum control over durability vs performance tradeoff
+- Your application has its own batching logic
+- You're okay with manual durability management
+
+## Usage Examples
+
+### Automatic Periodic Flushing
+
+```rust
+use rotortree::{RotorTreeConfig, FlushPolicy};
+use std::time::Duration;
+
+let config = RotorTreeConfig {
+    // ...
+    flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Insertions are automatically flushed every 10ms
+let (root, token) = tree.insert([42u8; 32])?;
+
+// Wait for this specific insert to be durable
+token.wait();
+```
+
+### Manual Flushing
+
+```rust
+use rotortree::{RotorTreeConfig, FlushPolicy};
+
+let config = RotorTreeConfig {
+    // ...
+    flush_policy: FlushPolicy::Manual,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Insert many entries
+for leaf in leaves {
+    tree.insert(leaf)?;
+}
+
+// Explicitly flush when ready
+tree.flush()?;
+```
+
+### Blockchain Integration Pattern
+
+```rust
+use rotortree::{FlushPolicy, CheckpointPolicy};
+
+// Manual control for blockchain sync
+let config = RotorTreeConfig {
+    path: db_path,
+    flush_policy: FlushPolicy::Manual,
+    checkpoint_policy: CheckpointPolicy::Manual,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Process a block
+for tx in block.transactions {
+    for nullifier in tx.nullifiers {
+        tree.insert(nullifier)?;
+    }
+}
+
+// Flush after each block
+tree.flush()?;
+
+// Checkpoint after each epoch (e.g., every 100 blocks)
+if block.height % 100 == 0 {
+    tree.checkpoint()?;
+}
+```
+
+## Durability Guarantees
+
+| Policy | Durability | Max Data Loss on Crash | Performance |
+|--------|-----------|------------------------|-------------|
+| `Interval(1ms)` | High | ≤1ms of writes | Medium-High |
+| `Interval(10ms)` | Medium | ≤10ms of writes | High |
+| `Interval(100ms)` | Low | ≤100ms of writes | Very High |
+| `Manual` | Application-controlled | Depends on flush frequency | Maximum |
+
+## Performance Considerations
+
+<Note>
+  fsync operations are relatively expensive. The flush policy significantly impacts throughput:
+  
+  - **`Interval(10ms)`**: ~100 fsyncs/second
+  - **`Interval(100ms)`**: ~10 fsyncs/second  
+  - **`Manual` with batching**: Can achieve >1M inserts/sec between flushes
+</Note>
+
+### Measuring Flush Impact
+
+```rust
+use std::time::Instant;
+
+let start = Instant::now();
+tree.flush()?;
+let elapsed = start.elapsed();
+println!("Flush took: {:?}", elapsed);
+```
+
+Typical fsync latencies:
+- SSD: 0.1-1ms
+- HDD: 5-10ms
+- NVMe: 0.05-0.3ms
+
+## Default Value
+
+```rust
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self::Interval(Duration::from_millis(10))
+    }
+}
+```
+
+## Related
+
+- [DurabilityToken](/api/durability-token) - Waiting for specific inserts to become durable
+- [RotorTree::flush()](/api/rotor-tree#flush) - Manual flush method
+- [RotorTree::insert_durable()](/api/rotor-tree#insert_durable) - Insert + flush in one call
+- [RotorTreeConfig](/api/rotor-tree-config) - Full configuration structure

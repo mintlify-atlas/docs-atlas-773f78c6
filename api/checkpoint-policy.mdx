@@ -1,0 +1,253 @@
+---
+title: CheckpointPolicy
+description: Controls when checkpoints are triggered to materialize tree state
+---
+
+`CheckpointPolicy` determines when the in-memory tree state is materialized to data files on disk. Checkpoints enable WAL truncation and allow cold tree levels to be mmap'd instead of kept in memory.
+
+## Definition
+
+Defined in `src/storage/checkpoint.rs:40`
+
+```rust
+pub enum CheckpointPolicy {
+    /// Caller calls `checkpoint()` explicitly
+    Manual,
+    /// Auto-checkpoint after every N WAL entries
+    EveryNEntries(u64),
+    /// Auto-checkpoint when in-memory chunks exceed N bytes
+    MemoryThreshold(usize),
+    /// Checkpoint only on graceful close
+    OnClose,
+}
+```
+
+## Variants
+
+### `Manual`
+
+**Default policy.** No automatic checkpoints occur. The application must call `tree.checkpoint()` explicitly.
+
+**Use when:**
+- You have natural checkpoint points (e.g., end of epoch)
+- You want full control over checkpoint timing
+- You're okay with unbounded WAL growth until manual checkpoint
+- Development and testing scenarios
+
+**Tradeoff:** WAL file grows unbounded until checkpoint, recovery time increases.
+
+### `EveryNEntries(u64)`
+
+Automatically triggers a checkpoint after every `N` WAL entries (insertions).
+
+<ParamField path="n" type="u64" required>
+  Number of WAL entries between automatic checkpoints.
+  
+  **Recommended values:**
+  - `10_000` - Frequent checkpoints, low memory, longer WAL recovery
+  - `100_000` - Balanced approach
+  - `1_000_000` - Infrequent checkpoints, higher memory, shorter WAL recovery
+</ParamField>
+
+**Use when:**
+- You want predictable checkpoint frequency
+- WAL size needs to be bounded
+- Recovery time needs to be predictable
+
+**Tradeoff:** More frequent checkpoints = higher I/O overhead, but faster recovery.
+
+### `MemoryThreshold(usize)`
+
+Automatically triggers a checkpoint when uncheckpointed in-memory chunks exceed the specified byte threshold.
+
+<ParamField path="bytes" type="usize" required>
+  Memory threshold in bytes. When uncheckpointed tree data exceeds this, a checkpoint is triggered.
+  
+  **Recommended values:**
+  - `268_435_456` (256 MiB) - Frequent checkpoints
+  - `1_073_741_824` (1 GiB) - Balanced
+  - `4_294_967_296` (4 GiB) - Infrequent checkpoints
+</ParamField>
+
+**Use when:**
+- You want to bound memory usage
+- Insert patterns are irregular
+- Memory pressure is a concern
+
+**Tradeoff:** Ties checkpoint frequency to memory usage rather than time or entry count.
+
+### `OnClose`
+
+Checkpoint is only performed when the tree is gracefully closed via `tree.close()`.
+
+**Use when:**
+- Tree lifetime is short
+- You want minimal checkpoint overhead during operation
+- Acceptable to replay full WAL on next open
+- Testing or ephemeral workloads
+
+**Tradeoff:** WAL grows for entire session. On next open, entire WAL must be replayed.
+
+<Warning>
+  If the process crashes, no checkpoint exists. The next recovery will replay the entire WAL from the beginning.
+</Warning>
+
+## Usage Examples
+
+### Manual Checkpoints
+
+```rust
+use rotortree::{CheckpointPolicy, RotorTreeConfig};
+
+let config = RotorTreeConfig {
+    // ...
+    checkpoint_policy: CheckpointPolicy::Manual,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Insert many entries
+for leaf in leaves {
+    tree.insert(leaf)?;
+}
+
+// Manually checkpoint when ready
+tree.checkpoint()?;
+```
+
+### Entry-Based Checkpointing
+
+```rust
+use rotortree::CheckpointPolicy;
+
+let config = RotorTreeConfig {
+    // ...
+    checkpoint_policy: CheckpointPolicy::EveryNEntries(100_000),
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Checkpoint automatically triggered every 100k inserts
+for i in 0..500_000 {
+    tree.insert(leaf)?;
+    // Background thread handles checkpoints
+}
+```
+
+### Memory-Based Checkpointing
+
+```rust
+use rotortree::CheckpointPolicy;
+
+let config = RotorTreeConfig {
+    // ...
+    checkpoint_policy: CheckpointPolicy::MemoryThreshold(
+        1_073_741_824 // 1 GiB
+    ),
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// Checkpoint triggered when uncheckpointed data exceeds 1 GiB
+tree.insert_many(&large_batch)?;
+```
+
+### OnClose Pattern
+
+```rust
+use rotortree::CheckpointPolicy;
+
+let config = RotorTreeConfig {
+    // ...
+    checkpoint_policy: CheckpointPolicy::OnClose,
+    // ...
+};
+
+let tree = RotorTree::open(hasher, config)?;
+
+// No checkpoints during operation
+tree.insert_many(&leaves)?;
+
+// Checkpoint happens here
+tree.close()?;
+```
+
+## Checkpoint Process
+
+When a checkpoint occurs:
+
+1. **WAL flush**: All buffered entries are fsynced
+2. **Snapshot capture**: Current tree state is captured atomically
+3. **Data file writes**: New chunks written to `data/level_N/shard_XXXX.dat`
+4. **Metadata update**: `checkpoint.meta` written atomically
+5. **WAL truncation**: WAL is reset to just the header
+6. **Tiering**: Eligible levels are remapped to mmap'd files (see [TieringConfig](/api/tiering-config))
+
+Checkpoint writes are atomic - a crash mid-checkpoint leaves the previous checkpoint intact.
+
+## Waiting for Checkpoints
+
+With automatic checkpoint policies, you can wait for background checkpoints:
+
+```rust
+use std::time::Duration;
+
+// Wait up to 30 seconds for next checkpoint to complete
+let completed = tree.wait_for_checkpoint(Duration::from_secs(30));
+
+if completed {
+    println!("Checkpoint completed");
+} else {
+    println!("Timeout waiting for checkpoint");
+}
+```
+
+## Policy Comparison
+
+| Policy | Checkpoint Timing | WAL Growth | Recovery Time | Memory Usage | Use Case |
+|--------|------------------|------------|---------------|--------------|----------|
+| `Manual` | Application-controlled | Unbounded | Proportional to WAL | Grows with tree | Full control |
+| `EveryNEntries(N)` | Every N inserts | Bounded | ≤N entries | Bounded | Predictable checkpoints |
+| `MemoryThreshold(B)` | Memory-based | Variable | Variable | Bounded to B | Memory-constrained |
+| `OnClose` | On close only | Entire session | Full WAL replay | Grows with tree | Short-lived trees |
+
+## Performance Considerations
+
+<Note>
+  Checkpoints are I/O intensive operations. Consider:
+  
+  - **Checkpoint duration**: Proportional to uncheckpointed data (typically 100ms-10s)
+  - **Write amplification**: Each checkpoint writes all new chunks to disk
+  - **Background vs blocking**: Automatic policies use background threads (non-blocking)
+</Note>
+
+### Measuring Checkpoint Performance
+
+```rust
+use std::time::Instant;
+
+let start = Instant::now();
+tree.checkpoint()?;
+let elapsed = start.elapsed();
+println!("Checkpoint took: {:?}", elapsed);
+```
+
+## Default Value
+
+```rust
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+```
+
+## Related
+
+- [TieringConfig](/api/tiering-config) - Controls mmap behavior after checkpoint
+- [RotorTree::checkpoint()](/api/rotor-tree#checkpoint) - Manual checkpoint method
+- [RotorTree::wait_for_checkpoint()](/api/rotor-tree#wait_for_checkpoint) - Wait for background checkpoint
+- [RotorTreeConfig](/api/rotor-tree-config) - Full configuration structure

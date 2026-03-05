@@ -1,0 +1,205 @@
+---
+title: 'TreeHasher'
+description: 'Domain-separated hasher for Merkle tree operations'
+---
+
+## Overview
+
+`TreeHasher<H>` wraps any `Hasher` and enforces domain separation for Merkle tree operations:
+
+- **Leaves** are hashed with a `0x00` prefix tag
+- **Internal nodes** are hashed with a `0x01` prefix tag plus child count
+
+This prevents second-preimage attacks where leaf data could be mistaken for internal node hashes.
+
+## Type Definition
+
+```rust
+pub struct TreeHasher<H>(H);
+```
+
+<ParamField path="H" type="Hasher">
+  The underlying hash function. Must implement the `Hasher` trait.
+</ParamField>
+
+## Construction
+
+### new
+
+Create a new tree hasher wrapping the given hasher.
+
+```rust
+pub fn new(hasher: H) -> Self
+```
+
+<ParamField path="hasher" type="H">
+  The underlying hasher to wrap
+</ParamField>
+
+<ParamField path="returns" type="TreeHasher<H>">
+  A new tree hasher with domain separation
+</ParamField>
+
+**Example:**
+
+```rust
+use rotortree::{TreeHasher, Blake3Hasher};
+
+let hasher = Blake3Hasher::new();
+let tree_hasher = TreeHasher::new(hasher);
+```
+
+## Methods
+
+### inner
+
+Get a reference to the underlying hasher.
+
+```rust
+pub fn inner(&self) -> &H
+```
+
+<ParamField path="returns" type="&H">
+  Reference to the wrapped hasher
+</ParamField>
+
+### hash_leaf
+
+Hash a leaf value with domain separation.
+
+```rust
+pub fn hash_leaf(&self, leaf: &Hash) -> Hash
+```
+
+<ParamField path="leaf" type="&Hash">
+  The 32-byte leaf hash to wrap
+</ParamField>
+
+<ParamField path="returns" type="Hash">
+  Domain-separated leaf hash with `0x00` prefix
+</ParamField>
+
+**Implementation:**
+
+```rust
+// Prepends 0x00 tag before hashing
+let mut buf = [0u8; 33];
+buf[1..].copy_from_slice(leaf);
+// Hash the tagged buffer
+```
+
+**Example:**
+
+```rust
+use rotortree::{TreeHasher, Blake3Hasher, Hash};
+
+let tree_hasher = TreeHasher::new(Blake3Hasher::new());
+
+// Hash some leaf data first
+let mut state = tree_hasher.inner().new_state();
+state.update(b"leaf data");
+let leaf_hash = state.finalize();
+
+// Then apply tree domain separation
+let tree_leaf = tree_hasher.hash_leaf(&leaf_hash);
+```
+
+### hash_children
+
+Hash internal node children with domain separation.
+
+```rust
+pub fn hash_children(&self, children: &[Hash]) -> Hash
+```
+
+<ParamField path="children" type="&[Hash]">
+  Slice of child node hashes (max 255 children)
+</ParamField>
+
+<ParamField path="returns" type="Hash">
+  Domain-separated internal node hash
+</ParamField>
+
+**Implementation:**
+
+```rust
+// Prepends 0x01 tag and child count
+state.update(&[0x01, len as u8]);
+// Then hashes all children sequentially
+state.update(children.as_flattened());
+```
+
+**Example:**
+
+```rust
+use rotortree::{TreeHasher, Blake3Hasher, Hash};
+
+let tree_hasher = TreeHasher::new(Blake3Hasher::new());
+
+let child1: Hash = [1u8; 32];
+let child2: Hash = [2u8; 32];
+let child3: Hash = [3u8; 32];
+
+let parent = tree_hasher.hash_children(&[child1, child2, child3]);
+```
+
+## Domain Separation Format
+
+### Leaf Hash
+
+```
+[0x00 | 32-byte leaf hash]
+```
+
+Total: 33 bytes before final hashing
+
+### Internal Node Hash
+
+```
+[0x01 | child_count | child1 | child2 | ... | childN]
+```
+
+Where:
+- `0x01` is the internal node tag
+- `child_count` is a single byte (max 255 children)
+- Each child is 32 bytes
+
+Total: 2 + (32 × N) bytes before final hashing
+
+## Why Domain Separation?
+
+Without domain separation, an attacker could:
+
+1. Craft leaf data that looks like internal node hashes
+2. Create second-preimage attacks
+3. Generate hash collisions between different tree levels
+
+The prefix tags ensure leaves and internal nodes produce different hashes even with identical content.
+
+## Usage in Tree Operations
+
+```rust
+use rotortree::{Tree, TreeHasher, Blake3Hasher};
+
+let hasher = TreeHasher::new(Blake3Hasher::new());
+let tree = Tree::new(hasher, 4); // 4-ary tree
+
+// Tree operations use hash_leaf and hash_children internally
+```
+
+## Related Types
+
+<CardGroup cols={2}>
+  <Card title="Hasher" icon="function" href="/api/hasher">
+    Core hash trait interface
+  </Card>
+  <Card title="Blake3Hasher" icon="bolt" href="/api/blake3-hasher">
+    Built-in BLAKE3 implementation
+  </Card>
+</CardGroup>
+
+## Trait Implementations
+
+`TreeHasher<H>` implements:
+- `Clone` (when `H: Clone`)
+- `Debug`

@@ -1,0 +1,215 @@
+---
+title: Concurrent Benchmarks
+description: Performance benchmarks for concurrent read/write workloads
+---
+
+## Overview
+
+Concurrent benchmarks measure the performance of `LeanIMT` with the `concurrent` feature enabled, which switches to `&self` methods with internal `RwLock` (via [parking_lot](https://github.com/Amanieu/parking_lot)) for thread-safe access.
+
+<Info>
+These benchmarks simulate realistic concurrent workloads where multiple threads generate proofs while a writer thread inserts new leaves.
+</Info>
+
+## Configuration
+
+The `concurrent` feature changes the tree API:
+
+- **Without `concurrent`**: `&mut self` methods (single-threaded only)
+- **With `concurrent`**: `&self` methods with internal `RwLock<State>`
+
+This allows:
+- Multiple concurrent readers (proof generation, snapshots)
+- Single writer at a time (insertions)
+- Lock-free snapshots (readers never block writers)
+
+## Benchmark Implementation
+
+All concurrent benchmarks in `tree_bench_concurrent.rs` use the same underlying tree (`LeanIMT`) but with shared ownership via `Arc`:
+
+```rust
+let tree = Arc::new(LeanIMT::<Blake3Hasher, N, 32>::new(Blake3Hasher));
+```
+
+## Insertion Benchmarks
+
+### Single Insert (Concurrent)
+
+Inserts leaves one-by-one using the `concurrent` API:
+
+- **Counts**: 1K, 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Lock acquisition overhead per insertion
+
+```rust
+for &leaf in &leaves {
+    tree.insert(leaf).unwrap();  // acquires write lock each time
+}
+```
+
+### Batch Insert (Concurrent)
+
+Inserts all leaves in a single `insert_many` call:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Lock hold time for large batch insertions
+
+```rust
+tree.insert_many(&leaves).unwrap();  // holds write lock for entire batch
+```
+
+### Incremental Insert (Concurrent)
+
+Pre-populates tree with N/2 leaves, then inserts remaining N/2:
+
+- **Counts**: 10K, 100K, 1M leaves (total)
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Lock contention on large existing trees
+
+## Proof Operations
+
+### Generate Proof (Concurrent)
+
+Generates a proof from a snapshot (lock-free read):
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Snapshot acquisition cost with concurrent access
+
+```rust
+let snap = tree.snapshot();  // acquires read lock briefly
+snap.generate_proof(count / 2).unwrap();  // no lock held
+```
+
+### Verify Proof (Concurrent)
+
+Verifies a proof (no lock required):
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Same as single-threaded (verification is lock-free)
+
+### Snapshot (Concurrent)
+
+Measures snapshot acquisition cost:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Read lock + Arc clone overhead
+
+```rust
+tree.snapshot();  // acquires read lock, clones Arc<State>
+```
+
+## Concurrent Contention
+
+The most realistic benchmark: **4 reader threads** continuously generate proofs while **1 writer thread** inserts all leaves.
+
+- **Counts**: 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **Reader behavior**: Spin-loop generating proofs for middle leaf until tree is full
+- **Writer behavior**: Insert all leaves via `insert_many`
+- **What it measures**: Real-world concurrent read/write contention
+
+```rust
+std::thread::scope(|s| {
+    // spawn 4 reader threads
+    for _ in 0..4 {
+        let tree = Arc::clone(&tree);
+        s.spawn(move || {
+            loop {
+                let snap = tree.snapshot();
+                let size = snap.size();
+                if size > 0 {
+                    snap.generate_proof(size / 2).unwrap();
+                }
+                if size >= target_count {
+                    break;
+                }
+            }
+        });
+    }
+    
+    // insert on main thread
+    tree.insert_many(&leaves).unwrap();
+});
+```
+
+<Note>
+This benchmark simulates a blockchain indexer that:
+- Continuously serves proof requests from multiple API workers
+- Processes new blocks/leaves from a single sync thread
+</Note>
+
+## Lock Contention Analysis
+
+### Read Lock (Snapshot)
+
+- **Cost**: Minimal — parking_lot's RwLock is fast for uncontended reads
+- **Contention**: Only with concurrent writers (rare)
+- **Optimization**: Snapshots are cheap; cache them if generating multiple proofs
+
+### Write Lock (Insert)
+
+- **Cost**: Higher — must wait for all readers to finish
+- **Contention**: Increases with number of concurrent readers
+- **Optimization**: Use `insert_many` to amortize lock overhead across many leaves
+
+<Info>
+Insert operations block all concurrent readers. For high-concurrency scenarios, batch your writes as much as possible to minimize lock hold time.
+</Info>
+
+## Comparison: Concurrent vs Single-Threaded
+
+| Workload | Single-Threaded | Concurrent |
+|----------|----------------|------------|
+| **Overhead** | None (direct access) | RwLock acquisition |
+| **Throughput** | Higher for single writer | Lower due to locking |
+| **Variance** | Lower (predictable) | Higher (depends on contention) |
+| **Use Case** | Single-threaded apps | Multi-threaded services |
+
+<Warning>
+Only use the `concurrent` feature if you actually need concurrent access. For single-threaded workloads, the lock overhead is pure cost with no benefit.
+</Warning>
+
+## Parallel + Concurrent
+
+You can combine both features:
+
+```bash
+cargo bench --bench tree_bench_concurrent --features concurrent,parallel
+```
+
+This enables:
+- **Concurrent access**: Multiple threads can read/write
+- **Parallel hashing**: `insert_many` uses rayon for hash computation
+
+<Note>
+Combining `concurrent` + `parallel` gives the best performance for multi-threaded workloads with large batch insertions. The writer holds the lock while rayon parallelizes the hash computation.
+</Note>
+
+## Running the Benchmarks
+
+```bash
+# Concurrent benchmarks (requires 'concurrent' feature)
+cargo bench --bench tree_bench_concurrent --features concurrent
+
+# Concurrent + parallel
+cargo bench --bench tree_bench_concurrent --features concurrent,parallel
+
+# List all concurrent benchmarks
+cargo bench --bench tree_bench_concurrent --features concurrent -- --list
+```
+
+## When to Use Concurrent Mode
+
+**Use `concurrent` when:**
+- Multiple threads need to generate proofs simultaneously
+- A background thread inserts leaves while API threads serve requests
+- You're building a multi-threaded service (e.g., gRPC server with worker pool)
+
+**Don't use `concurrent` when:**
+- Your application is single-threaded
+- You can coordinate access at a higher level (e.g., message passing)
+- You need absolute maximum throughput (lock overhead matters)

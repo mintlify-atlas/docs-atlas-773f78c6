@@ -1,0 +1,517 @@
+---
+title: Proof Generation and Verification
+description: Generate inclusion proofs, consistency proofs, and update proofs without transferring leaves
+---
+
+# Proof Generation and Verification
+
+RotorTree supports two types of proofs:
+1. **Inclusion Proofs**: Prove a leaf exists at a specific index in the tree
+2. **Consistency Proofs**: Prove a smaller tree is a prefix of a larger tree
+
+Both proof types support efficient verification and serialization.
+
+## Inclusion Proofs
+
+Inclusion proofs prove that a specific leaf exists at a given index in the tree.
+
+### Generating Inclusion Proofs
+
+Proofs are always generated from snapshots:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher};
+
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Insert some leaves
+let leaves: Vec<[u8; 32]> = (0..100)
+    .map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
+    .collect();
+tree.insert_many(&leaves).unwrap();
+
+// Take snapshot
+let snap = tree.snapshot();
+
+// Generate proof for leaf at index 42
+let proof = snap.generate_proof(42).unwrap();
+
+println!("Proof for leaf {}: {} levels", proof.leaf_index, proof.level_count);
+```
+
+<Note>
+**Why snapshots?** Generating proofs from snapshots allows lock-free concurrent proof generation while the tree continues accepting insertions.
+</Note>
+
+### Verifying Inclusion Proofs
+
+Proofs are self-contained and can be verified independently:
+
+```rust
+use rotortree::TreeHasher;
+
+let th = TreeHasher::new(Blake3Hasher);
+
+// Proof contains: root, leaf, leaf_index, tree_size, and sibling hashes
+assert!(proof.verify(&th).unwrap());
+```
+
+#### Verifying Against a Trusted Root
+
+If you have an externally-trusted root (e.g., from a blockchain):
+
+```rust
+let trusted_root: [u8; 32] = /* from blockchain */;
+
+assert!(proof.verify_against(&th, trusted_root).unwrap());
+```
+
+### Proof Structure
+
+An `NaryProof` contains:
+
+```rust
+pub struct NaryProof<const N: usize, const MAX_DEPTH: usize> {
+    pub root: Hash,           // Merkle root
+    pub leaf: Hash,           // The leaf being proved
+    pub leaf_index: u64,      // 0-based leaf index
+    pub tree_size: u64,       // Number of leaves when proof was generated
+    pub level_count: usize,   // Number of valid levels
+    pub levels: [ProofLevel<N>; MAX_DEPTH], // Sibling hashes per level
+}
+```
+
+Each level contains:
+- **position**: Child position within the group (0..N-1)
+- **sibling_count**: Number of siblings (0 for lifted nodes)
+- **siblings**: Sibling hashes for reconstruction
+
+## Consistency Proofs
+
+Consistency proofs prove that an old tree state is a prefix of a new tree state. This enables light clients to verify state transitions without downloading all leaves.
+
+### Generating Consistency Proofs
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Insert initial leaves
+let initial_leaves: Vec<[u8; 32]> = (0..1000)
+    .map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
+    .collect();
+tree.insert_many(&initial_leaves).unwrap();
+
+let old_snap = tree.snapshot();
+let old_root = old_snap.root().unwrap();
+let old_size = old_snap.size();
+
+// Insert more leaves
+let new_leaves: Vec<[u8; 32]> = (1000..2000)
+    .map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
+    .collect();
+tree.insert_many(&new_leaves).unwrap();
+
+let new_snap = tree.snapshot();
+
+// Generate consistency proof
+let consistency_proof = new_snap
+    .generate_consistency_proof(old_size, old_root)
+    .unwrap();
+```
+
+### Verifying Consistency Proofs
+
+Consistency proofs can be verified in three ways:
+
+<Tabs>
+  <Tab title="Basic Verification">
+    Verify both roots match:
+    
+    ```rust
+    let th = TreeHasher::new(Blake3Hasher);
+    assert!(consistency_proof.verify(&th).unwrap());
+    ```
+  </Tab>
+  
+  <Tab title="Trusted Roots">
+    Verify against externally-trusted old and new roots:
+    
+    ```rust
+    assert!(consistency_proof.verify_against(
+        &th,
+        trusted_old_root,
+        trusted_new_root
+    ).unwrap());
+    ```
+  </Tab>
+  
+  <Tab title="State Transition">
+    Verify transition from trusted old root (most common for light clients):
+    
+    ```rust
+    // Light client has trusted_old_root
+    assert!(consistency_proof.verify_transition(&th, trusted_old_root).unwrap());
+    
+    // Now trust consistency_proof.new_root
+    let new_trusted_root = consistency_proof.new_root;
+    ```
+  </Tab>
+</Tabs>
+
+### Proof Structure
+
+```rust
+pub struct ConsistencyProof<const N: usize, const MAX_DEPTH: usize> {
+    pub old_root: Hash,       // Root of smaller tree
+    pub new_root: Hash,       // Root of larger tree
+    pub old_size: u64,        // Leaf count in smaller tree
+    pub new_size: u64,        // Leaf count in larger tree
+    pub level_count: usize,   // Number of valid levels
+    pub levels: [ConsistencyLevel<N>; MAX_DEPTH],
+}
+```
+
+Each level contains:
+- **shared_count**: Number of shared siblings from old tree
+- **new_count**: Number of new-only siblings
+- **hashes**: Array of `[shared..., new...]` hashes
+
+## Updating Inclusion Proofs
+
+Light clients can update old inclusion proofs to new tree states using **only** the consistency proof—no leaf data required!
+
+### Light Client Pattern
+
+This pattern enables efficient light clients:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher, NaryProof};
+
+const N: usize = 4;
+const MAX_DEPTH: usize = 14;
+const TRACKED_LEAF: u64 = 42;
+
+// Light client tracks one inclusion proof
+let mut tracked_proof: Option<NaryProof<N, MAX_DEPTH>> = None;
+let mut current_root: Option<[u8; 32]> = None;
+
+// === Bootstrap Phase ===
+let initial_leaves: Vec<[u8; 32]> = /* download initial state */;
+let mut tree = LeanIMT::<Blake3Hasher, N, MAX_DEPTH>::new(Blake3Hasher);
+tree.insert_many(&initial_leaves).unwrap();
+
+let snap = tree.snapshot();
+let proof = snap.generate_proof(TRACKED_LEAF).unwrap();
+let th = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&th).unwrap());
+
+tracked_proof = Some(proof);
+current_root = snap.root();
+
+// Now drop the tree - we don't need leaves anymore!
+drop(tree);
+
+// === Update Phase (no leaves required!) ===
+let consistency_proof = /* receive from full node */;
+
+// Verify state transition
+assert!(consistency_proof.verify_transition(&th, current_root.unwrap()).unwrap());
+
+// Update our tracked inclusion proof
+let old_proof = tracked_proof.as_ref().unwrap();
+let updated_proof = consistency_proof
+    .update_inclusion_proof(old_proof, &th)
+    .unwrap();
+
+// Verify updated proof
+assert!(updated_proof.verify(&th).unwrap());
+assert_eq!(updated_proof.root, consistency_proof.new_root);
+
+// Update our state
+tracked_proof = Some(updated_proof);
+current_root = Some(consistency_proof.new_root);
+```
+
+### Bandwidth Savings
+
+Consistency proofs are much smaller than transferring leaves:
+
+```rust
+use std::mem::size_of_val;
+
+let leaves = vec![[0u8; 32]; 10_000];
+let leaf_bytes = leaves.len() * 32; // 320 KB
+
+let consistency_proof = /* ... */;
+let proof_bytes = size_of_val(&consistency_proof); // ~2-4 KB
+
+println!("Leaf transfer: {} KB", leaf_bytes / 1024);
+println!("Consistency proof: {} bytes", proof_bytes);
+println!("Savings: {}x", leaf_bytes / proof_bytes);
+```
+
+<Note>
+Consistency proofs are typically 50-100x smaller than transferring leaves, making them ideal for bandwidth-constrained light clients.
+</Note>
+
+## Full Example: Light Client Sync
+
+Here's a complete example from the repository:
+
+```rust
+use rotortree::{
+    Blake3Hasher, LeanIMT, RotorTree, RotorTreeConfig,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+    TreeHasher, NaryProof, ConsistencyProof,
+};
+use std::{path::PathBuf, sync::mpsc, thread};
+
+const N: usize = 4;
+const MAX_DEPTH: usize = 14;
+const BATCH_SIZE: u64 = 10_000;
+const NUM_BATCHES: usize = 5;
+const TRACKED_LEAF: u64 = 812;
+
+enum NodeMessage {
+    Bootstrap { leaves: Vec<[u8; 32]> },
+    Update { consistency_proof: ConsistencyProof<N, MAX_DEPTH> },
+    Shutdown,
+}
+
+enum ClientMessage {
+    InclusionProof(NaryProof<N, MAX_DEPTH>),
+}
+
+fn generate_leaves(start: u64, count: u64) -> Vec<[u8; 32]> {
+    (start..start + count)
+        .map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
+        .collect()
+}
+
+fn full_node(tx: mpsc::Sender<NodeMessage>, rx: mpsc::Receiver<ClientMessage>) {
+    let config = RotorTreeConfig {
+        path: PathBuf::from(".db"),
+        flush_policy: FlushPolicy::Manual,
+        checkpoint_policy: CheckpointPolicy::OnClose,
+        tiering: TieringConfig::default(),
+        verify_checkpoint: false,
+    };
+    let tree = RotorTree::<Blake3Hasher, N, MAX_DEPTH>::open(
+        Blake3Hasher,
+        config
+    ).unwrap();
+    
+    let th = TreeHasher::new(Blake3Hasher);
+    let mut inserted = 0u64;
+    
+    for batch in 0..NUM_BATCHES {
+        let leaves = generate_leaves(inserted, BATCH_SIZE);
+        
+        if batch == 0 {
+            // Bootstrap: send leaves
+            tree.insert_many(&leaves).unwrap();
+            inserted += BATCH_SIZE;
+            
+            println!("[full node] bootstrap: {} leaves", leaves.len());
+            tx.send(NodeMessage::Bootstrap { leaves }).unwrap();
+            
+            let ClientMessage::InclusionProof(proof) = rx.recv().unwrap();
+            assert!(proof.verify(&th).unwrap());
+        } else {
+            // Update: send consistency proof only
+            let old_snap = tree.snapshot();
+            let old_size = old_snap.size();
+            let old_root = old_snap.root().unwrap();
+            
+            tree.insert_many(&leaves).unwrap();
+            inserted += BATCH_SIZE;
+            
+            let new_snap = tree.snapshot();
+            let consistency_proof = new_snap
+                .generate_consistency_proof(old_size, old_root)
+                .unwrap();
+            
+            let proof_bytes = std::mem::size_of_val(&consistency_proof);
+            let leaf_bytes = leaves.len() * 32;
+            println!(
+                "[full node] batch {}: {} bytes (vs {} for leaves)",
+                batch, proof_bytes, leaf_bytes
+            );
+            
+            tx.send(NodeMessage::Update { consistency_proof }).unwrap();
+            
+            let ClientMessage::InclusionProof(proof) = rx.recv().unwrap();
+            assert!(proof.verify(&th).unwrap());
+        }
+    }
+    
+    tx.send(NodeMessage::Shutdown).unwrap();
+    tree.close().unwrap();
+}
+
+fn light_client(tx: mpsc::Sender<ClientMessage>, rx: mpsc::Receiver<NodeMessage>) {
+    let th = TreeHasher::new(Blake3Hasher);
+    let mut tracked_proof: Option<NaryProof<N, MAX_DEPTH>> = None;
+    let mut current_root: Option<[u8; 32]> = None;
+    
+    loop {
+        match rx.recv().unwrap() {
+            NodeMessage::Bootstrap { leaves } => {
+                let mut tree = LeanIMT::<Blake3Hasher, N, MAX_DEPTH>::new(Blake3Hasher);
+                tree.insert_many(&leaves).unwrap();
+                let snap = tree.snapshot();
+                
+                let proof = snap.generate_proof(TRACKED_LEAF).unwrap();
+                assert!(proof.verify(&th).unwrap());
+                
+                current_root = snap.root();
+                println!("[light client] bootstrap: {} leaves", leaves.len());
+                
+                tracked_proof = Some(proof.clone());
+                tx.send(ClientMessage::InclusionProof(proof)).unwrap();
+                
+                // Drop tree - we don't need it anymore!
+            }
+            
+            NodeMessage::Update { consistency_proof } => {
+                // Verify state transition
+                assert!(consistency_proof
+                    .verify_transition(&th, current_root.unwrap())
+                    .unwrap());
+                
+                // Update inclusion proof without any leaves!
+                let old_proof = tracked_proof.as_ref().unwrap();
+                let updated_proof = consistency_proof
+                    .update_inclusion_proof(old_proof, &th)
+                    .unwrap();
+                
+                assert!(updated_proof.verify(&th).unwrap());
+                assert_eq!(updated_proof.root, consistency_proof.new_root);
+                
+                current_root = Some(consistency_proof.new_root);
+                println!(
+                    "[light client] update: {} -> {} leaves",
+                    consistency_proof.old_size,
+                    consistency_proof.new_size
+                );
+                
+                tracked_proof = Some(updated_proof.clone());
+                tx.send(ClientMessage::InclusionProof(updated_proof)).unwrap();
+            }
+            
+            NodeMessage::Shutdown => {
+                println!("[light client] shutdown");
+                break;
+            }
+        }
+    }
+}
+
+fn main() {
+    let (node_tx, client_rx) = mpsc::channel();
+    let (client_tx, node_rx) = mpsc::channel();
+    
+    let node_handle = thread::spawn(move || full_node(node_tx, node_rx));
+    let client_handle = thread::spawn(move || light_client(client_tx, client_rx));
+    
+    node_handle.join().unwrap();
+    client_handle.join().unwrap();
+    
+    std::fs::remove_dir_all(".db").unwrap();
+}
+```
+
+## Proof Serialization
+
+RotorTree supports multiple serialization formats:
+
+<CodeGroup>
+```rust Wincode (Fastest)
+// Requires "wincode" feature
+let bytes = wincode::serialize(&proof).unwrap();
+let decoded: NaryProof<4, 20> = wincode::deserialize(&bytes).unwrap();
+```
+
+```rust Serde JSON
+// Requires "serde" feature
+let json = serde_json::to_string(&proof).unwrap();
+let decoded: NaryProof<4, 20> = serde_json::from_str(&json).unwrap();
+```
+
+```rust Serde Bincode
+// Requires "serde" feature
+let bytes = bincode::serialize(&proof).unwrap();
+let decoded: NaryProof<4, 20> = bincode::deserialize(&bytes).unwrap();
+```
+</CodeGroup>
+
+<Note>
+**Wincode** is optimized for Solana and provides the fastest serialization. Use `serde` for ecosystem compatibility.
+</Note>
+
+## Common Patterns
+
+### Pattern 1: Batch Proof Generation
+
+```rust
+let snap = tree.snapshot();
+let indices: Vec<u64> = vec![0, 100, 500, 1000];
+
+let proofs: Vec<_> = indices
+    .iter()
+    .map(|&idx| snap.generate_proof(idx).unwrap())
+    .collect();
+
+// All proofs generated from same snapshot
+assert!(proofs.iter().all(|p| p.root == proofs[0].root));
+```
+
+### Pattern 2: Concurrent Proof Generation
+
+With the `concurrent` feature:
+
+```rust
+use rayon::prelude::*;
+
+let snap = tree.snapshot(); // Arc-based, cheap to clone
+
+let proofs: Vec<_> = (0..1000)
+    .into_par_iter()
+    .map(|idx| snap.generate_proof(idx).unwrap())
+    .collect();
+```
+
+### Pattern 3: Proof Verification Pipeline
+
+```rust
+let th = TreeHasher::new(Blake3Hasher);
+
+// Verify batch of proofs against trusted root
+let trusted_root = /* from blockchain */;
+
+let all_valid = proofs.iter().all(|proof| {
+    proof.verify_against(&th, trusted_root).unwrap_or(false)
+});
+
+assert!(all_valid);
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="In-Memory Trees" icon="memory" href="/guides/in-memory-tree">
+    Learn the basics of creating and using LeanIMT
+  </Card>
+  
+  <Card title="Persistent Storage" icon="database" href="/guides/persistent-storage">
+    Enable WAL-based persistence for crash recovery
+  </Card>
+  
+  <Card title="Feature Flags" icon="flag" href="/guides/feature-flags">
+    Explore serialization and concurrency features
+  </Card>
+  
+  <Card title="Performance Tuning" icon="gauge" href="/guides/tuning-performance">
+    Optimize proof generation for your workload
+  </Card>
+</CardGroup>

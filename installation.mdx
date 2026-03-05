@@ -1,0 +1,192 @@
+---
+title: Installation
+description: Add RotorTree to your Rust project and configure feature flags
+---
+
+## Prerequisites
+
+RotorTree requires Rust 1.90.0 or later. Ensure you have Rust installed:
+
+```bash
+rustc --version
+```
+
+## Add to Your Project
+
+<Steps>
+  <Step title="Add the dependency">
+    Add RotorTree to your `Cargo.toml`:
+
+    ```toml Cargo.toml
+    [dependencies]
+    rotortree = "0.15.0"
+    ```
+
+    This installs RotorTree with default features (`blake3` hasher).
+  </Step>
+
+  <Step title="Choose your features">
+    Configure feature flags based on your use case. See the sections below for different configurations.
+  </Step>
+</Steps>
+
+## Feature Flags
+
+RotorTree offers multiple feature flags to optimize for your specific use case:
+
+### Default Configuration
+
+```toml Cargo.toml
+[dependencies]
+rotortree = "0.15.0"
+```
+
+Includes:
+- `blake3`: Blake3 hasher (default)
+- In-memory tree only (no persistence)
+- `no_std` compatible
+
+### In-Memory with Concurrency
+
+For multi-threaded applications with shared tree access:
+
+```toml Cargo.toml
+[dependencies]
+rotortree = { version = "0.15.0", features = ["concurrent"] }
+```
+
+**Includes:**
+- `concurrent`: Enables `&self` methods with internal `RwLock` (via `parking_lot`)
+- Thread-safe operations
+- Requires `std`
+
+### In-Memory with Parallelism
+
+For large batch insertions with parallel processing:
+
+```toml Cargo.toml
+[dependencies]
+rotortree = { version = "0.15.0", features = ["parallel"] }
+```
+
+**Includes:**
+- `parallel`: Rayon-parallelized `insert_many` for large batches
+- Significant performance gains for bulk operations
+- Requires `std`
+
+<Note>
+  The `parallel` feature works exceptionally well for batch insertions. The in-memory benchmark achieves peak throughput up to ~190M leaves/sec.
+</Note>
+
+### With WAL Persistence
+
+For crash-safe persistence with write-ahead logging:
+
+```toml Cargo.toml
+[dependencies]
+rotortree = { version = "0.15.0", features = ["storage"] }
+```
+
+**Includes:**
+- `storage`: Write-ahead log (WAL) with checkpointing
+- Memory-mapped data files for cold levels
+- File locking and durability guarantees
+- Requires `std`
+- Automatically includes: `parking_lot`, `arc-swap`, `wincode`, `crc-fast`, `fs4`, `memmap2`
+
+### Full-Featured Configuration
+
+For production applications needing all features:
+
+```toml Cargo.toml
+[dependencies]
+rotortree = { version = "0.15.0", features = ["storage", "parallel", "concurrent", "serde"] }
+```
+
+**Includes:**
+- All storage features
+- Parallel batch processing
+- Thread-safe concurrent access
+- Serde serialization support
+
+### Minimal no_std Configuration
+
+For embedded or constrained environments:
+
+```toml Cargo.toml
+[dependencies]
+rotortree = { version = "0.15.0", default-features = false }
+```
+
+**Includes:**
+- Core tree algorithm only
+- Zero dependencies
+- `no_std` compatible
+- No hasher (bring your own)
+
+<Warning>
+  This configuration requires you to implement your own hasher trait.
+</Warning>
+
+### Additional Feature Flags
+
+<CardGroup cols={2}>
+  <Card title="wincode" icon="binary">
+    Adds `wincode` serde derives to proof types for efficient serialization.
+  </Card>
+  
+  <Card title="serde" icon="file-code">
+    Adds standard Serde support with `serde_with` for ecosystem compatibility (e.g., Jolt prover).
+  </Card>
+  
+  <Card title="test-helpers" icon="flask">
+    Testing utilities (development only).
+  </Card>
+  
+  <Card title="docs" icon="book">
+    Documentation utilities (development only).
+  </Card>
+</CardGroup>
+
+## Capacity Planning
+
+When using the `storage` feature with tiering:
+
+<CodeGroup>
+```text N=4, MAX_DEPTH=16
+~4.3B nullifiers in 41 GiB
+```
+
+```text N=8, MAX_DEPTH=10
+~1B nullifiers in 37 GiB
+```
+</CodeGroup>
+
+<Note>
+  For most use cases, consider using a new tree per generation and encoding nullifiers with the generation to keep storage manageable.
+</Note>
+
+## Verify Installation
+
+Create a simple test to verify your installation:
+
+```rust src/main.rs
+use rotortree::{LeanIMT, Blake3Hasher};
+
+fn main() {
+    let tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+    println!("RotorTree initialized successfully!");
+}
+```
+
+Run with:
+
+```bash
+cargo run
+```
+
+## Next Steps
+
+<Card title="Quickstart Guide" icon="rocket" href="/quickstart">
+  Learn how to create your first Merkle tree and generate proofs
+</Card>

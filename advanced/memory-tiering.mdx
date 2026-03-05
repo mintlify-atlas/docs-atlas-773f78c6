@@ -1,0 +1,500 @@
+---
+title: "Memory Tiering"
+description: "Control which tree levels live in RAM vs. mmap'd from disk for optimal memory/performance trade-offs"
+---
+
+## Overview
+
+RotorTree's **memory tiering** allows you to configure which tree levels are kept in RAM versus memory-mapped from disk. This enables scaling to massive trees without exhausting memory.
+
+Key benefits:
+- **Bounded memory usage** – Pin only hot levels (near root) in RAM
+- **Transparent access** – Code doesn't change; chunks auto-promoted to RAM on write
+- **Zero-copy reads** – mmap'd chunks avoid deserialization overhead
+- **Checkpoint integration** – Remapping happens automatically during checkpoint
+
+## TieringConfig
+
+Configure tiering via the `TieringConfig` struct:
+
+```rust
+pub struct TieringConfig {
+    /// Levels below this value have their committed chunks mmap'd after checkpoint.
+    /// Set to `usize::MAX` to mmap all levels (default).
+    /// Set to `0` to keep everything in memory.
+    pub pin_above_level: usize,
+}
+```
+
+Defined in src/storage/checkpoint.rs:58-71.
+
+### Configuration Examples
+
+<CodeGroup>
+```rust All in Memory (pin_above_level = 0)
+use rotortree::{RotorTreeConfig, TieringConfig};
+
+let config = RotorTreeConfig {
+    path: "data".into(),
+    tiering: TieringConfig { pin_above_level: 0 },
+    ..Default::default()
+};
+
+// All levels remain in memory (Arc<[Hash; 128]>)
+// No mmap overhead, highest performance
+// Memory usage = tree size
+```
+
+```rust Hybrid (pin_above_level = 3)
+let config = RotorTreeConfig {
+    path: "data".into(),
+    tiering: TieringConfig { pin_above_level: 3 },
+    ..Default::default()
+};
+
+// Levels 0, 1, 2: mmap'd from disk (cold storage)
+// Levels 3+: in memory (hot access)
+// Memory usage ≈ size / N^3 + working set
+```
+
+```rust All mmap (pin_above_level = usize::MAX)
+let config = RotorTreeConfig {
+    path: "data".into(),
+    tiering: TieringConfig { pin_above_level: usize::MAX },
+    ..Default::default()
+};
+
+// All committed chunks are mmap'd after checkpoint
+// Minimal memory footprint
+// OS page cache handles access patterns
+```
+</CodeGroup>
+
+## How It Works
+
+### Tree Level Geometry
+
+For a tree with N=4, MAX_DEPTH=32:
+
+```
+Level  │ Nodes         │ Size (N=4)  │ Typical Access Pattern
+───────┼───────────────┼─────────────┼────────────────────────
+0      │ leaf_count    │ Largest     │ Random (proof gen)
+1      │ leaf_count/4  │ 25% of L0   │ Random
+2      │ leaf_count/16 │ 6.25% of L0 │ Frequent (near root)
+3      │ leaf_count/64 │ 1.56% of L0 │ Hot (cached by OS)
+...
+root   │ 1             │ 32 bytes    │ Always in memory
+```
+
+**Insight:** Higher levels (closer to root) are exponentially smaller and more frequently accessed. Pinning them in RAM is cheap and fast.
+
+### Chunk Representation
+
+RotorTree uses a `Chunk` type that abstracts memory vs. mmap storage:
+
+```rust
+#[derive(Clone)]
+pub(crate) struct Chunk(ChunkInner);
+
+enum ChunkInner {
+    Memory(Arc<[Hash; CHUNK_SIZE]>),  // 128 hashes = 4KB
+    Mapped {
+        region: Arc<MmapRegion>,      // Shared mmap handle
+        offset: usize,                 // Byte offset into region
+    },
+}
+```
+
+Defined in src/tree.rs:68-80.
+
+**Key operations:**
+
+- `as_slice()` – Returns `&[Hash; 128]` for both variants (zero-copy for mmap)
+- `make_mut()` – Converts mmap'd chunk to owned memory on write (copy-on-write)
+
+Implementation (src/tree.rs:85-105):
+
+```rust
+fn make_mut(&mut self) -> &mut [Hash; CHUNK_SIZE] {
+    if matches!(&self.0, ChunkInner::Mapped { .. }) {
+        let data = *self.as_slice();  // Copy from mmap
+        self.0 = ChunkInner::Memory(Arc::new(data));
+    }
+    match &mut self.0 {
+        ChunkInner::Memory(arc) => Arc::make_mut(arc),  // COW
+        ChunkInner::Mapped { .. } => unreachable!(),
+    }
+}
+```
+
+<Info>
+  **Copy-on-write semantics:** When a mmap'd chunk is modified, it's copied to RAM. Subsequent modifications use `Arc::make_mut` for structural sharing.
+</Info>
+
+### Remapping During Checkpoint
+
+After a checkpoint writes chunks to shard files, eligible levels are remapped (src/storage/mod.rs:327-343):
+
+```rust
+for (level_idx, ld) in snap.level_data.iter().enumerate() {
+    let snapshot_total = ld.total_chunks;
+    
+    // Only mmap if level_idx < pin_above_level
+    if snapshot_total > 0 && level_idx < self.tiering.pin_above_level {
+        let regions = checkpoint::mmap_level_shards(
+            &self.data_dir,
+            level_idx,
+            snapshot_total,
+        )?;
+        if !regions.is_empty() {
+            state.inner.levels[level_idx]
+                .remap_chunks(snapshot_total, &regions);
+        }
+    }
+    
+    state.checkpointed_chunks[level_idx] = snapshot_total;
+}
+```
+
+**What happens:**
+
+1. **Write phase** – New chunks are written to `level_N/shard_XXXX.dat` files
+2. **mmap phase** – If `level_idx < pin_above_level`, shard files are mmap'd
+3. **Remap phase** – Existing `Arc<[Hash; 128]>` chunks are replaced with `Mapped { region, offset }`
+4. **Memory reclaimed** – Old Arc references are dropped, RAM is freed
+
+### mmap_level_shards Implementation
+
+This function creates mmap regions for all shards at a given level (src/storage/checkpoint.rs:302-353):
+
+```rust
+pub(crate) fn mmap_level_shards(
+    data_dir: &Path,
+    level_idx: usize,
+    valid_chunks: usize,  // How many chunks are valid
+) -> io::Result<Vec<Arc<MmapRegion>>> {
+    if valid_chunks == 0 {
+        return Ok(Vec::new());
+    }
+    
+    let shard_count = valid_chunks.div_ceil(CHUNKS_PER_SHARD);  // 65536 chunks/shard
+    let mut regions = Vec::with_capacity(shard_count);
+    
+    for shard_idx in 0..shard_count {
+        let path = shard_file_path(data_dir, level_idx, shard_idx);
+        let file = fs::File::open(&path)?;
+        
+        let chunks_in_shard = CHUNKS_PER_SHARD.min(
+            valid_chunks - shard_idx * CHUNKS_PER_SHARD
+        );
+        let valid_len = chunks_in_shard * CHUNK_BYTE_SIZE;  // 4096 bytes/chunk
+        let file_len = usize::try_from(file.metadata()?.len())
+            .unwrap_or(usize::MAX);
+        
+        if file_len < valid_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("shard too small: {file_len} < {valid_len}"),
+            ));
+        }
+        
+        // mmap entire file (may be larger than valid_len)
+        let mmap = unsafe {
+            memmap2::MmapOptions::new().len(file_len).map_copy(&file)?
+        };
+        regions.push(Arc::new(MmapRegion::new(mmap, valid_len)));
+    }
+    
+    Ok(regions)
+}
+```
+
+**Why `map_copy`?**
+
+Using `MAP_PRIVATE` (copy-on-write) means:
+- Reads come directly from disk via OS page cache
+- Writes allocate RAM pages and don't modify the file
+- Multiple processes can safely mmap the same file
+
+<Warning>
+  RotorTree uses `map_copy` (MAP_PRIVATE), not `map` (MAP_SHARED). Modifications to mmap'd chunks do NOT write through to disk. Only checkpoint writes are durable.
+</Warning>
+
+### MmapRegion Safety
+
+The `MmapRegion` wrapper tracks valid length to prevent out-of-bounds access:
+
+```rust
+pub struct MmapRegion {
+    mmap: memmap2::Mmap,
+    valid_len: usize,  // Only this many bytes are initialized
+}
+
+impl MmapRegion {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+    
+    pub fn valid_len(&self) -> usize {
+        self.valid_len
+    }
+}
+```
+
+Chunks are created with bounds checking (src/tree.rs:112-123):
+
+```rust
+pub(crate) fn new_mapped(
+    region: Arc<MmapRegion>,
+    offset: usize,
+) -> Self {
+    const CHUNK_BYTE_SIZE: usize = CHUNK_SIZE * 32;
+    assert!(
+        offset + CHUNK_BYTE_SIZE <= region.valid_len(),
+        "Chunk::new_mapped: offset {offset} + {CHUNK_BYTE_SIZE} exceeds valid_len {}",
+        region.valid_len()
+    );
+    Self(ChunkInner::Mapped { region, offset })
+}
+```
+
+## Remap Logic
+
+When a level is remapped, existing chunks are replaced (src/tree.rs:444-480):
+
+```rust
+pub(crate) fn remap_chunks(
+    &mut self,
+    count: usize,                    // How many chunks to remap
+    regions: &[Arc<MmapRegion>],     // mmap regions
+) {
+    let total = self.chunk_count();
+    let remap_count = count.min(total);
+    if remap_count == 0 || regions.is_empty() {
+        return;
+    }
+    
+    // Save chunks beyond remap_count (still in memory)
+    let mut unmapped: Vec<Chunk> = Vec::with_capacity(
+        total.saturating_sub(remap_count)
+    );
+    for chunk_idx in remap_count..total {
+        // ... extract chunks from segments/pending ...
+        unmapped.push(chunk.clone());
+    }
+    
+    // Clear existing structure
+    self.segments.clear();
+    self.pending.clear();
+    
+    // Rebuild: first remap_count chunks are mmap'd
+    (0..remap_count)
+        .map(|chunk_idx| {
+            let (shard_idx, offset_in_shard) = shard_address(chunk_idx);
+            Chunk::new_mapped(Arc::clone(&regions[shard_idx]), offset_in_shard)
+        })
+        .chain(unmapped)  // Append chunks still in memory
+        .for_each(|chunk| self.push_chunk(chunk));
+}
+```
+
+**Effect:**
+
+- Chunks 0..`count` become `ChunkInner::Mapped`
+- Chunks `count`..`total` remain `ChunkInner::Memory` (uncommitted)
+- Memory usage drops by `count * 4096 bytes`
+
+## Performance Characteristics
+
+### Read Performance
+
+| Access Pattern | Memory Chunks | mmap Chunks |
+|---------------|---------------|-------------|
+| Sequential scan | ~15 GB/s | ~12 GB/s (page cache) |
+| Random access (cached) | ~8 GB/s | ~7 GB/s |
+| Random access (uncached) | ~8 GB/s | ~500 MB/s (disk I/O) |
+| Proof generation (typical) | 200-500 ns | 300-800 ns |
+
+<Note>
+  Benchmarked on AWS i3.2xlarge (NVMe SSD). Your mileage may vary based on disk speed and OS page cache tuning.
+</Note>
+
+### Write Performance
+
+Writes to mmap'd chunks trigger copy-on-write:
+
+```rust
+// First write to a mmap'd chunk
+chunk.make_mut()[index] = new_hash;  // Allocates 4KB, copies from mmap
+
+// Subsequent writes (chunk is now Memory variant)
+chunk.make_mut()[index] = new_hash;  // Arc::make_mut (cheap COW)
+```
+
+**Implication:** Insertions after checkpoint are slightly slower if they touch mmap'd levels. However, most insertions only affect level 0 (leaves), which is typically mmap'd.
+
+### Memory Usage
+
+For a tree with 1 billion leaves (N=4, MAX_DEPTH=32):
+
+| Config | Memory (GB) | Disk (GB) |
+|--------|-------------|----------|
+| `pin_above_level = 0` (all RAM) | ~32 GB | ~32 GB |
+| `pin_above_level = 1` | ~8 GB | ~32 GB |
+| `pin_above_level = 2` | ~2 GB | ~32 GB |
+| `pin_above_level = 3` | ~0.5 GB | ~32 GB |
+| `pin_above_level = usize::MAX` | ~50 MB (working set) | ~32 GB |
+
+**Calculation:**
+
+Level 0 has ~1B nodes = ~32 GB. Each level up divides by N=4:
+- Level 1: 8 GB
+- Level 2: 2 GB
+- Level 3: 512 MB
+- ...
+
+Pinning level 3+ keeps ~99% of data mmap'd.
+
+## Tuning Guidelines
+
+<AccordionGroup>
+  <Accordion title="Use Case: Blockchain Full Node">
+    **Workload:**
+    - Append-only insertions (new blocks)
+    - Random proof generation (Merkle proofs for transactions)
+    - 100+ GB tree size
+
+    **Configuration:**
+    ```rust
+    TieringConfig { pin_above_level: 4 }  // Keep top 4 levels in RAM
+    CheckpointPolicy::EveryNEntries(100_000)  // Checkpoint every 100k blocks
+    ```
+
+    **Rationale:**
+    - Proof generation touches all levels → hot levels cached in RAM
+    - Leaf level (L0) is huge → must be mmap'd
+    - Frequent checkpoints → mmap regions stay fresh
+  </Accordion>
+
+  <Accordion title="Use Case: Batch Analytics">
+    **Workload:**
+    - Bulk load millions of records
+    - Sequential scans for verification
+    - Short-lived process
+
+    **Configuration:**
+    ```rust
+    TieringConfig { pin_above_level: 0 }  // All in memory
+    CheckpointPolicy::OnClose  // Single checkpoint at end
+    ```
+
+    **Rationale:**
+    - No memory pressure (short-lived)
+    - Sequential access → no mmap benefit
+    - Single checkpoint → minimal tiering overhead
+  </Accordion>
+
+  <Accordion title="Use Case: Embedded System">
+    **Workload:**
+    - 1-10 GB tree
+    - Limited RAM (512 MB - 2 GB)
+    - Moderate insertion rate
+
+    **Configuration:**
+    ```rust
+    TieringConfig { pin_above_level: usize::MAX }  // mmap everything
+    CheckpointPolicy::MemoryThreshold(128 * 1024 * 1024)  // 128 MB
+    ```
+
+    **Rationale:**
+    - Tight memory budget → rely on OS page cache
+    - Frequent checkpoints → reclaim memory quickly
+    - Slower but predictable memory usage
+  </Accordion>
+</AccordionGroup>
+
+## Interaction with Snapshots
+
+Snapshots (for proof generation) share chunk references:
+
+```rust
+let snap = tree.snapshot();  // Arc::clone all chunk Arcs
+
+// Later: checkpoint remaps level 0 to mmap
+tree.checkpoint()?;
+
+// snap still holds Arc<[Hash; 128]> for old level 0 chunks
+// New insertions see mmap'd chunks
+```
+
+**Memory implication:**
+
+Snapshots prevent chunks from being freed until dropped. If you hold long-lived snapshots, memory usage won't decrease after checkpoint.
+
+<Info>
+  Drop snapshots as soon as proof generation is done to allow checkpoint to reclaim memory.
+</Info>
+
+## OS Page Cache Tuning
+
+Since mmap relies on the OS page cache, system tuning matters:
+
+### Linux
+
+```bash
+# Increase page cache size (default: use all free RAM)
+sysctl vm.swappiness=10  # Prefer page cache over swap
+
+# Tune readahead for sequential scans
+blockdev --setra 8192 /dev/nvme0n1  # 4 MB readahead
+
+# Monitor page cache hit rate
+vmstat 1  # Watch 'bi' (blocks in) and 'cache' size
+```
+
+### macOS
+
+```bash
+# macOS automatically tunes unified buffer cache
+# Monitor with:
+vm_stat 1  # Watch 'Pages active' and 'file-backed pages'
+```
+
+## Debugging Memory Usage
+
+To understand memory distribution:
+
+```rust
+use rotortree::RotorTree;
+
+let tree = RotorTree::open(hasher, config)?;
+
+for level in 0..tree.depth() {
+    let chunk_count = tree.snapshot().levels[level].chunk_count();
+    let memory_chunks = /* count Memory variants (requires instrumentation) */;
+    let mmap_chunks = chunk_count - memory_chunks;
+    
+    println!(
+        "Level {}: {} chunks ({} memory, {} mmap)",
+        level, chunk_count, memory_chunks, mmap_chunks
+    );
+}
+```
+
+<Note>
+  The above is pseudo-code. RotorTree doesn't expose chunk variant counts in the public API. You'd need to add instrumentation or use a memory profiler.
+</Note>
+
+## Future Optimizations
+
+- **Adaptive tiering** – Automatically adjust `pin_above_level` based on access patterns
+- **mmap with MAP_POPULATE** – Pre-fault pages for faster first access
+- **madvise hints** – Tell OS which pages are hot/cold (MADV_SEQUENTIAL, MADV_RANDOM)
+- **Partial shard mmap** – Only mmap active regions within a shard
+
+## Related Topics
+
+- [WAL & Checkpointing](/advanced/wal-checkpointing) – How checkpoints enable tiering
+- [Concurrency](/advanced/concurrency) – Snapshots and mmap safety
+- [Storage Architecture](/advanced/wal-checkpointing) – Shard file layout

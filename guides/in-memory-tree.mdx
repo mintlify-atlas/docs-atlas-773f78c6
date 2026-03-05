@@ -1,0 +1,241 @@
+---
+title: In-Memory Tree Usage
+description: Learn how to use RotorTree's LeanIMT for fast in-memory Merkle tree operations
+---
+
+# In-Memory Tree Usage
+
+The `LeanIMT` provides a high-performance in-memory n-ary Merkle tree with no persistence overhead. This is the fastest mode and is ideal when you have a reliable bootstrapping mechanism or don't need crash recovery.
+
+## Basic Setup
+
+To use in-memory mode, disable default features in your `Cargo.toml`:
+
+```toml
+[dependencies]
+rotortree = { version = "0.15", default-features = false }
+```
+
+This gives you a `no_std` library with zero dependencies for just the core algorithm.
+
+## Creating a Tree
+
+Create a tree by specifying:
+- **Hasher**: The hash function to use (e.g., `Blake3Hasher`)
+- **N**: Branching factor (2, 4, 8, or 16)
+- **MAX_DEPTH**: Maximum tree depth
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher};
+
+// N=4 branching factor, MAX_DEPTH=20
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+```
+
+<Note>
+The branching factor N directly affects tree depth. With N=4, you reduce depth compared to binary trees while maintaining the same leaf capacity. For example:
+- N=2, MAX_DEPTH=16 → ~65K leaves
+- N=4, MAX_DEPTH=16 → ~4.3B leaves
+- N=8, MAX_DEPTH=10 → ~1B leaves
+</Note>
+
+## Inserting Leaves
+
+<Steps>
+  <Step title="Single Insert">
+    Insert one leaf and get the new root:
+    
+    ```rust
+    let leaf = [1u8; 32];
+    let root = tree.insert(leaf).unwrap();
+    ```
+  </Step>
+
+  <Step title="Batch Insert">
+    Insert multiple leaves efficiently:
+    
+    ```rust
+    let leaves: Vec<[u8; 32]> = (0..1000u32)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h
+        })
+        .collect();
+    
+    let root = tree.insert_many(&leaves).unwrap();
+    ```
+    
+    <Note>
+    Use `insert_many` for better performance when inserting multiple leaves. With the `parallel` feature, this automatically parallelizes for large batches.
+    </Note>
+  </Step>
+</Steps>
+
+## Working with Snapshots
+
+Snapshots are cheap, immutable views of the tree state. They enable lock-free concurrent reads while insertions continue.
+
+```rust
+// Take a snapshot
+let snap = tree.snapshot();
+
+// Continue inserting while snapshot remains valid
+let more_leaves = vec![[2u8; 32]; 100];
+tree.insert_many(&more_leaves).unwrap();
+
+// Snapshot still points to old state
+let old_root = snap.root().unwrap();
+let old_size = snap.size();
+```
+
+<Warning>
+Snapshots use structural sharing via `Arc`, so they're cheap to clone. However, holding many old snapshots prevents garbage collection of old tree nodes.
+</Warning>
+
+## Generating Proofs
+
+Proofs are generated from snapshots, not the live tree:
+
+```rust
+use rotortree::TreeHasher;
+
+let snap = tree.snapshot();
+
+// Generate inclusion proof for leaf at index 0
+let proof = snap.generate_proof(0).unwrap();
+
+// Verify the proof
+let th = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&th).unwrap());
+```
+
+See the [Proof Generation](/guides/proof-generation) guide for advanced proof operations including consistency proofs and proof updates.
+
+## Performance Characteristics
+
+### Insertion Throughput
+
+The single-threaded variant achieves the best performance for low insertion rates:
+
+- **Single insert**: ~500ns per leaf (2M ops/sec)
+- **Batch insert**: Up to 190M leaves/sec with `parallel` feature
+- **Memory overhead**: 4 KB per chunk (128 hashes × 32 bytes)
+
+### Memory Usage
+
+With structural sharing via `Arc`:
+- Each snapshot shares most data with the tree
+- Only modified chunks are copied (copy-on-write)
+- Chunk size is 128 hashes = 4 KB per chunk
+
+## Complete Example
+
+Here's a complete working example:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher};
+
+fn main() {
+    // Create tree
+    let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+    
+    // Insert leaves
+    let leaves: Vec<[u8; 32]> = (0..1000u32)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h
+        })
+        .collect();
+    
+    let root = tree.insert_many(&leaves).unwrap();
+    println!("Root after 1000 leaves: {:?}", root);
+    
+    // Take snapshot and generate proof
+    let snap = tree.snapshot();
+    let proof = snap.generate_proof(0).unwrap();
+    
+    // Verify proof
+    let th = TreeHasher::new(Blake3Hasher);
+    assert!(proof.verify(&th).unwrap());
+    println!("Proof verified!");
+    
+    // Continue inserting
+    tree.insert([42u8; 32]).unwrap();
+    
+    // Old snapshot still valid
+    assert_eq!(snap.size(), 1000);
+}
+```
+
+## Optional Features
+
+Add these features to `Cargo.toml` for additional functionality:
+
+```toml
+[dependencies]
+rotortree = { version = "0.15", features = ["blake3", "concurrent", "parallel"] }
+```
+
+<CardGroup cols={2}>
+  <Card title="concurrent" icon="lock">
+    Switches to `&self` methods with internal `RwLock` via `parking_lot`. Enables safe concurrent access from multiple threads.
+  </Card>
+  
+  <Card title="parallel" icon="bolt">
+    Enables rayon-parallelized `insert_many` for large batches. Automatically kicks in above `ROTORTREE_PARALLEL_THRESHOLD` (default: 1024 parents).
+  </Card>
+  
+  <Card title="wincode" icon="binary">
+    Adds `wincode` serde derives to proof types for efficient serialization using Solana's wincode format.
+  </Card>
+  
+  <Card title="serde" icon="file-code">
+    Adds standard serde support to proof types for compatibility with the broader Rust ecosystem.
+  </Card>
+</CardGroup>
+
+## Common Pitfalls
+
+<Warning>
+**Leaf Pre-hashing**: RotorTree assumes leaves are already hashed. If you insert raw data, you must hash it first:
+
+```rust
+// ❌ Wrong - inserting raw data
+let data = b"my raw data";
+tree.insert(*data); // Compilation error: wrong size
+
+// ✓ Correct - hash first
+let leaf = *blake3::hash(b"my raw data").as_bytes();
+tree.insert(leaf).unwrap();
+```
+</Warning>
+
+<Warning>
+**Field Constraints**: If you're using this in a ZK circuit, ensure you constrain node values to your finite field **before** insertion. RotorTree operates on raw bytes and doesn't enforce field constraints.
+</Warning>
+
+<Warning>
+**Nullifier Deduplication**: RotorTree is append-only and doesn't check for duplicate leaves. Use a separate key-value database to track inserted nullifiers and prevent double-insertion.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Persistent Storage" icon="database" href="/guides/persistent-storage">
+    Learn how to enable WAL-based persistence with crash recovery
+  </Card>
+  
+  <Card title="Proof Generation" icon="shield-check" href="/guides/proof-generation">
+    Generate and verify inclusion and consistency proofs
+  </Card>
+  
+  <Card title="Performance Tuning" icon="gauge" href="/guides/tuning-performance">
+    Optimize for your workload with compile-time and runtime configuration
+  </Card>
+  
+  <Card title="Feature Flags" icon="flag" href="/guides/feature-flags">
+    Explore all available feature flags and their tradeoffs
+  </Card>
+</CardGroup>

@@ -1,0 +1,373 @@
+---
+title: 'Lean Incremental Merkle Trees'
+description: 'Understanding the n-ary lean incremental Merkle tree algorithm in RotorTree'
+---
+
+## What is a Lean IMT?
+
+A **Lean Incremental Merkle Tree (Lean IMT)** is a Merkle tree variant optimized for append-only operations. Unlike traditional Merkle trees that require pre-computing a complete tree structure, Lean IMTs grow incrementally as new leaves are added.
+
+<Note>
+RotorTree extends the original binary Lean IMT design from [PSE's lean-imt paper](https://zkkit.org/leanimt-paper.pdf) to support **n-ary trees** (2-ary, 3-ary, 4-ary, 8-ary, 16-ary, etc.).
+</Note>
+
+## Why N-ary?
+
+Increasing the branching factor from 2 (binary) to N offers several advantages:
+
+### Reduced Depth
+
+For the same number of leaves, an n-ary tree has lower depth:
+
+| Leaves | Binary (N=2) | Quaternary (N=4) | Octal (N=8) |
+|--------|--------------|------------------|-------------|
+| 16 | 4 levels | 2 levels | 2 levels |
+| 256 | 8 levels | 4 levels | 3 levels |
+| 4,096 | 12 levels | 6 levels | 4 levels |
+| 65,536 | 16 levels | 8 levels | 6 levels |
+
+### Efficient Disk Storage
+
+Grouping N children together aligns well with disk block sizes:
+
+- N=4: 4 × 32 bytes = 128 bytes per node group
+- N=8: 8 × 32 bytes = 256 bytes per node group
+- Combined with `CHUNK_SIZE=128`, each chunk is exactly 4 KB
+
+### Trade-offs
+
+- **Proof Size**: N-ary proofs include up to N-1 siblings per level (vs. 1 for binary)
+- **Hashing**: Each parent hash requires N inputs (vs. 2 for binary)
+- **Depth vs. Width**: Lower depth but wider nodes
+
+## The Lean Algorithm
+
+The "lean" aspect refers to how the tree handles incomplete levels without padding.
+
+### Node Lifting
+
+When a level has an incomplete group (fewer than N children), the remaining child is **lifted** directly to the parent level:
+
+```
+Example: Binary tree (N=2) with 3 leaves
+
+         Root
+        /    \
+     H(0,1)   2'    ← Leaf 2 is lifted
+      / \      
+     0   1
+     
+Leaves: [0, 1, 2]
+```
+
+```
+Example: Quaternary tree (N=4) with 5 leaves
+
+           Root
+          /    \
+     H(0,1,2,3)  4'    ← Leaf 4 is lifted
+      / | | \
+     0  1 2  3
+     
+Leaves: [0, 1, 2, 3, 4]
+```
+
+### Incremental Updates
+
+When inserting a new leaf:
+
+1. **Place leaf at index**: Append to level 0
+2. **Compute parent**: Hash the group containing the new leaf
+3. **Update parent level**: Store parent at level 1
+4. **Repeat**: Continue up the tree until reaching the root
+
+Only **affected nodes** are recomputed (one per level), not the entire tree.
+
+## Implementation Details
+
+### Type Signature
+
+```rust
+pub struct LeanIMT<H: Hasher, const N: usize, const MAX_DEPTH: usize> {
+    hasher: TreeHasher<H>,
+    inner: TreeInner<N, MAX_DEPTH>,
+}
+```
+
+### Compile-Time Constraints
+
+From `src/tree.rs:707-708`:
+
+```rust
+const _ASSERT_N: () = assert!(N >= 2, "branching factor must be at least 2");
+const _ASSERT_DEPTH: () = assert!(MAX_DEPTH >= 1, "max depth must be at least 1");
+```
+
+### Core Data Structures
+
+```rust
+struct TreeInner<const N: usize, const MAX_DEPTH: usize> {
+    levels: [ChunkedLevel; MAX_DEPTH],
+    root: Option<Hash>,
+    size: u64,          // Number of leaves
+    depth: usize,       // Hash layers above leaf level
+}
+```
+
+- `levels[0]`: Leaf level
+- `levels[1..depth]`: Internal node levels
+- `root`: Current Merkle root (cached)
+- `size`: Total number of leaves inserted
+- `depth`: `⌈log_N(size)⌉` - computed using `ceil_log_n()` in `src/tree.rs:141`
+
+## Algorithms
+
+### Single Insert
+
+From `src/tree.rs:812-855`, the `_insert` function:
+
+```rust
+fn _insert(inner: &mut TreeInner<N, MAX_DEPTH>, hasher: &TreeHasher<H>, leaf: Hash) -> Result<Hash, TreeError> {
+    let new_size = inner.size.checked_add(1)?;
+    let depth = ceil_log_n(new_size, N);
+    if depth > MAX_DEPTH {
+        return Err(TreeError::MaxDepthExceeded { max_depth: MAX_DEPTH });
+    }
+    
+    let index = inner.size as usize;
+    let mut node = leaf;
+    let mut idx = index;
+    
+    // Walk up the tree
+    for level in 0..depth {
+        inner.levels[level].set(idx, node)?;
+        
+        let child_pos = idx % N;
+        if child_pos != 0 {
+            // Not the first child in group, compute parent
+            let group_start = idx - child_pos;
+            let mut children = [[0u8; 32]; N];
+            inner.levels[level].get_group(group_start, child_pos, &mut children);
+            children[child_pos] = node;
+            node = hasher.hash_children(&children[..child_pos + 1]);
+        }
+        idx /= N;
+    }
+    
+    inner.root = Some(node);
+    inner.size = new_size;
+    inner.depth = depth;
+    Ok(node)
+}
+```
+
+**Key observations:**
+
+1. Only recomputes one hash per level (logarithmic complexity)
+2. Uses `get_group()` for efficient sibling retrieval
+3. Updates only when `child_pos != 0` (not the leftmost child)
+
+### Batch Insert
+
+From `src/tree.rs:906-1037`, the `_insert_many` function:
+
+1. **Extend leaves**: Append all leaves to level 0
+2. **Preallocate space**: Reserve capacity up the tree
+3. **Level-by-level processing**: Compute parents for each level
+4. **Parallel processing** (if `parallel` feature enabled):
+   - Chunks parent computation using Rayon
+   - Threshold: `ROTORTREE_PARALLEL_THRESHOLD` (default 1024)
+   - Work units: `PAR_CHUNK_SIZE` (default 64)
+
+```rust
+// Pseudocode for batch insert
+levels[0].extend(leaves);
+
+for level in 0..depth {
+    let level_len = levels[level].len();
+    let num_parents = level_len.div_ceil(N);
+    
+    if parallel_enabled && num_parents >= threshold {
+        // Rayon parallel computation
+        parents = parallel_map(|parent_idx| {
+            let group_start = parent_idx * N;
+            let group_end = min(group_start + N, level_len);
+            hash_children(levels[level][group_start..group_end])
+        });
+    } else {
+        // Sequential computation
+        parents = (0..num_parents).map(|parent_idx| { ... });
+    }
+    
+    levels[level + 1] = parents;
+}
+```
+
+## Depth Calculation
+
+The `ceil_log_n` function (from `src/tree.rs:141-151`) computes the depth efficiently:
+
+```rust
+pub(crate) fn ceil_log_n(size: u64, n: usize) -> usize {
+    if size <= 1 {
+        return 0;
+    }
+    if n.is_power_of_two() {
+        // Fast path for powers of 2
+        let k = n.trailing_zeros();
+        let bits = u64::BITS - (size - 1).leading_zeros();
+        return bits.div_ceil(k) as usize;
+    }
+    // General case
+    (size - 1).ilog(n as u64) as usize + 1
+}
+```
+
+Examples:
+
+| Size | N=2 | N=3 | N=4 | N=8 |
+|------|-----|-----|-----|-----|
+| 1 | 0 | 0 | 0 | 0 |
+| 2 | 1 | 1 | 1 | 1 |
+| 4 | 2 | 2 | 1 | 1 |
+| 8 | 3 | 2 | 2 | 1 |
+| 16 | 4 | 3 | 2 | 2 |
+| 256 | 8 | 6 | 4 | 3 |
+
+## Provability
+
+RotorTree's lean IMT design is compatible with zero-knowledge proof systems:
+
+### Jolt
+
+Execution cycles:
+
+```
+execution_cycles ≈ 2948.4 + 1832.9·N·D + (899.5 + 2993.8N - 103.4N²)·d
+```
+
+Where:
+- `N ∈ {2, 4, 8, 16}`: Branching factor
+- `D = MAX_DEPTH`: Maximum depth
+- `d = ⌈log_N(num_leaves)⌉`: Actual depth
+
+### Noir (UltraHonk via bb)
+
+Expression width:
+```
+expression_width = 68 + (217N - 100)·d
+```
+
+Circuit size:
+```
+circuit_size = 2962 + 30N + (551N² + 2629N - 2448)·d
+```
+
+<Info>
+The design was chosen specifically to have functional equivalents in ZK DSLs and Solidity.
+</Info>
+
+## Usage Examples
+
+### Binary Tree (N=2)
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher};
+
+let mut tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
+
+let leaves: Vec<[u8; 32]> = (0..4)
+    .map(|i| {
+        let mut h = [0u8; 32];
+        h[0] = i;
+        h
+    })
+    .collect();
+
+for &leaf in &leaves {
+    let root = tree.insert(leaf)?;
+    println!("Root after {} leaves: {:?}", tree.size(), root);
+}
+```
+
+### Quaternary Tree (N=4)
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Batch insert for better performance
+let leaves: Vec<[u8; 32]> = (0..1000).map(|i| {
+    let mut h = [0u8; 32];
+    h[..4].copy_from_slice(&i.to_le_bytes());
+    h
+}).collect();
+
+let root = tree.insert_many(&leaves)?;
+println!("Root: {:?}, Depth: {}", root, tree.depth());
+```
+
+### Octal Tree (N=8)
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, 8, 16>::new(Blake3Hasher);
+
+// Lower depth for same number of leaves
+for i in 0..256 {
+    tree.insert([i; 32])?;
+}
+
+println!("Depth: {} (vs. 8 for binary)", tree.depth());
+```
+
+## Performance Tips
+
+<AccordionGroup>
+  <Accordion title="Choosing N">
+    - **N=2**: Best for compatibility, smallest proofs
+    - **N=4**: Good balance for most use cases
+    - **N=8**: Very low depth, but larger proofs
+    - **N=16**: Extreme depth reduction, use with caution
+  </Accordion>
+
+  <Accordion title="Batch Operations">
+    Always use `insert_many()` for bulk insertions. It's significantly faster than repeated `insert()` calls:
+    - Preallocates all levels
+    - Amortizes Arc cloning costs
+    - Enables parallelism (with `parallel` feature)
+  </Accordion>
+
+  <Accordion title="Parallel Feature">
+    Enable the `parallel` feature for workloads with large batches:
+    ```toml
+    rotortree = { version = "*", features = ["parallel"] }
+    ```
+    
+    Tune the threshold:
+    ```bash
+    export ROTORTREE_PARALLEL_THRESHOLD=512
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Limitations
+
+<Warning>
+Lean IMTs have inherent trade-offs compared to full Merkle trees:
+
+1. **No random access updates**: Only append operations are supported
+2. **No deletions**: Cannot remove leaves once inserted
+3. **No sparse trees**: Cannot skip indices
+4. **Depth grows logarithmically**: `MAX_DEPTH` must accommodate maximum tree size
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Tree Structure" icon="diagram-project" href="./tree-structure">
+    Learn about structural sharing with chunks and segments
+  </Card>
+  
+  <Card title="Proof Generation" icon="shield-check" href="../features/proof-generation">
+    Generate and verify inclusion proofs
+  </Card>
+</CardGroup>

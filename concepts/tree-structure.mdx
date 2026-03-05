@@ -1,0 +1,518 @@
+---
+title: "Tree Structure & Structural Sharing"
+description: "Deep dive into RotorTree's chunked level design with structural sharing using Arc-backed segments"
+---
+
+## Overview
+
+RotorTree uses a sophisticated **chunked storage** system with **structural sharing** to enable efficient snapshots and memory management. This design allows lock-free concurrent reads while minimizing memory allocation overhead.
+
+## The Problem
+
+Naive Merkle tree implementations face challenges:
+
+1. **Snapshots are expensive**: Copying the entire tree for each snapshot is prohibitive
+2. **Memory overhead**: Each tree node requires a separate allocation
+3. **Cache efficiency**: Random access patterns hurt CPU cache performance
+4. **Concurrent access**: Shared mutable state requires locking
+
+RotorTree solves these problems with a three-tier chunked structure.
+
+## Three-Tier Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    ChunkedLevel                         │
+│                                                         │
+│  ┌───────────────────────────────────────────────┐    │
+│  │         Immutable Segments                     │    │
+│  │  (Arc<[Chunk; CHUNKS_PER_SEGMENT]>)           │    │
+│  │                                                │    │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐       │    │
+│  │  │ Segment │  │ Segment │  │ Segment │  ...  │    │
+│  │  │    0    │  │    1    │  │    2    │       │    │
+│  │  └─────────┘  └─────────┘  └─────────┘       │    │
+│  │     256          256          256              │    │
+│  │    chunks       chunks       chunks            │    │
+│  └───────────────────────────────────────────────┘    │
+│                                                         │
+│  ┌───────────────────────────────────────────────┐    │
+│  │         Pending Chunks                         │    │
+│  │  (Vec<Chunk>)                                  │    │
+│  │                                                │    │
+│  │  ┌───────┐  ┌───────┐  ┌───────┐             │    │
+│  │  │ Chunk │  │ Chunk │  │ Chunk │  ...        │    │
+│  │  └───────┘  └───────┘  └───────┘             │    │
+│  │     128        128        128                  │    │
+│  │    hashes     hashes     hashes                │    │
+│  │                                                │    │
+│  │  (max CHUNKS_PER_SEGMENT - 1 = 255)           │    │
+│  └───────────────────────────────────────────────┘    │
+│                                                         │
+│  ┌───────────────────────────────────────────────┐    │
+│  │         Tail Buffer                            │    │
+│  │  ([Hash; CHUNK_SIZE])                          │    │
+│  │                                                │    │
+│  │  [H₀][H₁][H₂][H₃]...[H₁₂₇]                    │    │
+│  │   ↑                    ↑                       │    │
+│  │   filled           tail_len                    │    │
+│  └───────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Tier 1: Tail Buffer
+
+A fixed-size mutable array for recently inserted hashes.
+
+**Source**: `src/tree.rs:170`
+
+```rust
+tail: [Hash; CHUNK_SIZE],   // Fixed-size array (128 hashes)
+tail_len: usize,             // Number of valid entries
+```
+
+- **Capacity**: `CHUNK_SIZE` (default: 128 hashes = 4 KB)
+- **Behavior**: Fills from left to right
+- **Promotion**: When full, promoted to a `Chunk` in the pending buffer
+
+### Tier 2: Pending Chunks
+
+A growable vector of committed chunks not yet frozen into a segment.
+
+**Source**: `src/tree.rs:167`
+
+```rust
+pending: Vec<Chunk>,  // At most CHUNKS_PER_SEGMENT - 1 items
+```
+
+- **Capacity**: Up to `CHUNKS_PER_SEGMENT - 1` (default: 255 chunks)
+- **Behavior**: Grows as tail buffers are promoted
+- **Freezing**: When full, all chunks are frozen into an immutable segment
+
+### Tier 3: Immutable Segments
+
+Arc-shared arrays of frozen chunks, never modified after creation.
+
+**Source**: `src/tree.rs:165`
+
+```rust
+segments: Vec<Arc<[Chunk; CHUNKS_PER_SEGMENT]>>,
+```
+
+- **Size**: Each segment contains exactly `CHUNKS_PER_SEGMENT` (default: 256) chunks
+- **Sharing**: Multiple snapshots can share the same segments via `Arc`
+- **Immutability**: Once created, never modified (copy-on-write if needed)
+
+## Chunks: The Core Unit
+
+A `Chunk` is an Arc-wrapped array of hashes, enabling structural sharing.
+
+### Without Storage Feature
+
+**Source**: `src/tree.rs:42-66`
+
+```rust
+struct Chunk(Arc<[Hash; CHUNK_SIZE]>);
+
+impl Chunk {
+    fn as_slice(&self) -> &[Hash; CHUNK_SIZE] {
+        &self.0
+    }
+    
+    fn make_mut(&mut self) -> &mut [Hash; CHUNK_SIZE] {
+        Arc::make_mut(&mut self.0)  // Copy-on-write if refcount > 1
+    }
+    
+    fn new_memory(data: [Hash; CHUNK_SIZE]) -> Self {
+        Self(Arc::new(data))
+    }
+}
+```
+
+- **Memory footprint**: 128 hashes × 32 bytes = 4,096 bytes per chunk
+- **Arc overhead**: 8 bytes (pointer) per reference
+- **Copy-on-write**: `Arc::make_mut()` clones only if shared
+
+### With Storage Feature
+
+**Source**: `src/tree.rs:68-132`
+
+With the `storage` feature, chunks can be backed by memory-mapped files:
+
+```rust
+enum ChunkInner {
+    Memory(Arc<[Hash; CHUNK_SIZE]>),
+    Mapped {
+        region: Arc<MmapRegion>,
+        offset: usize,
+    },
+}
+```
+
+- **Memory chunks**: Allocated in RAM, same as without storage
+- **Mapped chunks**: Read directly from mmap'd data files
+- **Transparent access**: Same `as_slice()` interface for both
+- **COW on write**: Mapped chunks copy to memory if modified
+
+## Constants
+
+From `src/tree.rs:21-28`:
+
+```rust
+pub(crate) const CHUNK_SIZE: usize = 128;
+const CHUNKS_PER_SEGMENT: usize = 256;
+```
+
+| Constant | Value | Rationale |
+|----------|-------|----------|
+| `CHUNK_SIZE` | 128 | 128 × 32 bytes = 4 KB (typical page size) |
+| `CHUNKS_PER_SEGMENT` | 256 | 256 × 4 KB = 1 MB segment granularity |
+
+These values balance:
+- **Cache efficiency**: 4 KB chunks fit in L1/L2 cache
+- **Arc granularity**: 1 MB segments reduce Arc overhead
+- **Snapshot cost**: Small enough for cheap clones
+
+## ChunkedLevel Operations
+
+### Reading: `get()` and `get_group()`
+
+**Source**: `src/tree.rs:214-249`
+
+```rust
+fn get(&self, index: usize) -> Result<Hash, TreeError> {
+    let chunk_idx = index / CHUNK_SIZE;
+    let offset = index % CHUNK_SIZE;
+    
+    if chunk_idx < self.chunk_count() {
+        Ok(self.chunk_slice(chunk_idx)[offset])
+    } else {
+        Ok(self.tail[offset])
+    }
+}
+
+fn get_group(&self, start: usize, count: usize, out: &mut [Hash]) {
+    let chunk_idx = start / CHUNK_SIZE;
+    let offset = start % CHUNK_SIZE;
+    
+    if offset + count <= CHUNK_SIZE {
+        // Fast path: entire group in one chunk
+        let src = if chunk_idx < self.chunk_count() {
+            &self.chunk_slice(chunk_idx)[offset..offset + count]
+        } else {
+            &self.tail[offset..offset + count]
+        };
+        out[..count].copy_from_slice(src);
+    } else {
+        // Slow path: spans chunks
+        for (i, item) in out.iter_mut().enumerate().take(count) {
+            *item = self.get(start + i)?;
+        }
+    }
+}
+```
+
+**Fast path optimization**: When a group of hashes fits entirely within a single chunk (common case), it's a single slice copy.
+
+### Writing: `set()` and `extend()`
+
+**Source**: `src/tree.rs:252-343`
+
+```rust
+fn set(&mut self, index: usize, value: Hash) -> Result<(), TreeError> {
+    if self.len <= index {
+        self.ensure_len(index + 1)?;
+    }
+    self.set_preallocated(index, value);
+    Ok(())
+}
+
+fn extend(&mut self, values: &[Hash]) -> Result<(), TreeError> {
+    // 1. Fill current tail
+    if self.tail_len > 0 {
+        let space = CHUNK_SIZE - self.tail_len;
+        let to_copy = space.min(values.len());
+        self.tail[self.tail_len..self.tail_len + to_copy]
+            .copy_from_slice(&values[..to_copy]);
+        self.tail_len += to_copy;
+        if self.tail_len == CHUNK_SIZE {
+            self.promote_tail();
+        }
+    }
+    
+    // 2. Create full chunks directly
+    let full_chunks = remaining.len() / CHUNK_SIZE;
+    for i in 0..full_chunks {
+        let chunk: [Hash; CHUNK_SIZE] = remaining[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE]
+            .try_into()?;
+        self.push_chunk(Chunk::new_memory(chunk));
+    }
+    
+    // 3. Copy remainder to tail
+    if !remaining.is_empty() {
+        self.tail[..remaining.len()].copy_from_slice(remaining);
+        self.tail_len = remaining.len();
+    }
+    
+    Ok(())
+}
+```
+
+**Efficiency**: `extend()` bypasses the tail buffer for full chunks, creating them directly.
+
+### Promotion and Freezing
+
+**Source**: `src/tree.rs:382-407`
+
+```rust
+fn promote_tail(&mut self) {
+    debug_assert_eq!(self.tail_len, CHUNK_SIZE);
+    self.push_chunk(Chunk::new_memory(self.tail));
+    self.tail = [[0u8; 32]; CHUNK_SIZE];
+    self.tail_len = 0;
+}
+
+fn push_chunk(&mut self, chunk: Chunk) {
+    self.pending.push(chunk);
+    if self.pending.len() == CHUNKS_PER_SEGMENT {
+        self.freeze_pending();
+    }
+}
+
+fn freeze_pending(&mut self) {
+    debug_assert_eq!(self.pending.len(), CHUNKS_PER_SEGMENT);
+    let pending = std::mem::take(&mut self.pending);
+    let boxed_arr: Box<[Chunk; CHUNKS_PER_SEGMENT]> = pending
+        .into_boxed_slice()
+        .try_into()
+        .unwrap();
+    self.segments.push(Arc::from(boxed_arr));
+}
+```
+
+**Flow**:
+1. Tail fills up → promote to pending
+2. Pending fills up → freeze to segment
+3. Segment created → immutable forever
+
+## Structural Sharing
+
+### Snapshots
+
+**Source**: `src/tree.rs:674-686`
+
+```rust
+fn snapshot(&self) -> TreeSnapshot<N, MAX_DEPTH> {
+    let mut levels = core::array::from_fn(|_| ChunkedLevel::new());
+    let snap_count = core::cmp::min(self.depth.saturating_add(1), MAX_DEPTH);
+    
+    for (dst, src) in levels.iter_mut().zip(self.levels.iter()).take(snap_count) {
+        *dst = src.clone();  // Clone ChunkedLevel
+    }
+    
+    TreeSnapshot {
+        levels,
+        root: self.root,
+        size: self.size,
+        depth: self.depth,
+    }
+}
+```
+
+**What gets cloned?**
+
+1. **Segments**: Only the `Arc` is cloned (cheap pointer bump)
+2. **Pending chunks**: Each `Chunk` is cloned (Arc pointer bump per chunk)
+3. **Tail buffer**: Copied entirely (128 hashes = 4 KB)
+
+**Cost analysis**:
+
+For a tree with 1M leaves (N=4, depth≈10):
+
+- Level 0: ~7,813 chunks
+  - Segments: ~30 segments × 8 bytes = 240 bytes
+  - Pending: ~0-255 chunks × 8 bytes ≈ 2 KB
+  - Tail: 4 KB
+- Levels 1-9: Similar but smaller
+
+**Total snapshot cost**: ~50-100 KB of Arc pointer bumps + ~40 KB of tail copies
+
+### Copy-on-Write Semantics
+
+**Source**: `src/tree.rs:53-55` and `src/tree.rs:96-105`
+
+```rust
+fn make_mut(&mut self) -> &mut [Hash; CHUNK_SIZE] {
+    if matches!(&self.0, ChunkInner::Mapped { .. }) {
+        // Mapped chunk: always copy to memory
+        let data = *self.as_slice();
+        self.0 = ChunkInner::Memory(Arc::new(data));
+    }
+    
+    match &mut self.0 {
+        ChunkInner::Memory(arc) => Arc::make_mut(arc),  // COW if shared
+        ChunkInner::Mapped { .. } => unreachable!(),
+    }
+}
+```
+
+**Behavior**:
+
+- If chunk is in a frozen segment (Arc refcount > 1), `Arc::make_mut()` clones it
+- If chunk is memory-mapped, always copies to RAM
+- Otherwise, returns mutable reference (no copy)
+
+## Memory Layout Example
+
+For a tree with 100,000 leaves at level 0:
+
+```
+100,000 leaves = 781 chunks + 1 partial chunk
+
+┌─────────────────────────────────────────────────┐
+│ Segment 0: chunks 0-255                         │
+│ (Arc shared with all snapshots)                 │
+│ Size: 256 × 4 KB = 1 MB                         │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ Segment 1: chunks 256-511                       │
+│ (Arc shared with all snapshots)                 │
+│ Size: 256 × 4 KB = 1 MB                         │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ Segment 2: chunks 512-767                       │
+│ (Arc shared with all snapshots)                 │
+│ Size: 256 × 4 KB = 1 MB                         │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ Pending: chunks 768-780 (13 chunks)             │
+│ (Arc per chunk, cloned on snapshot)             │
+│ Size: 13 × 4 KB = 52 KB                         │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ Tail: 32 hashes (partial chunk 781)             │
+│ (Copied on snapshot)                            │
+│ Size: 32 × 32 bytes = 1 KB                      │
+└─────────────────────────────────────────────────┘
+
+Total memory:
+- Actual data: 100,000 × 32 bytes ≈ 3.2 MB
+- Overhead: Arc pointers + metadata ≈ 100 KB
+- Snapshot cost: 3 Arc bumps + 13 Arc bumps + 1 KB copy ≈ 1.5 KB
+```
+
+## Chunk Access Patterns
+
+### Sequential Scan
+
+```rust
+for i in 0..level.len() {
+    let hash = level.get(i)?;
+    // Process hash
+}
+```
+
+**Performance**: Excellent cache locality within chunks (128 sequential hashes).
+
+### Group Access (Common in Tree Operations)
+
+```rust
+let group_start = parent_idx * N;
+let mut children = [[0u8; 32]; N];
+level.get_group(group_start, N, &mut children);
+let parent = hasher.hash_children(&children);
+```
+
+**Performance**: Fast path when group doesn't span chunk boundaries (common case).
+
+### Random Access
+
+```rust
+let hash = level.get(random_index)?;
+```
+
+**Performance**: Two-step lookup (chunk_idx, offset), but chunks are small enough to stay in cache.
+
+## Trade-offs
+
+<AccordionGroup>
+  <Accordion title="Chunk Size">
+    **Smaller chunks** (e.g., 64):
+    - ✅ Cheaper snapshots (less tail to copy)
+    - ✅ Finer-grained Arc sharing
+    - ❌ More Arc overhead
+    - ❌ More segment allocations
+    
+    **Larger chunks** (e.g., 256):
+    - ✅ Less Arc overhead
+    - ✅ Better sequential scan performance
+    - ❌ More expensive snapshots
+    - ❌ Wasted space for small trees
+    
+    **Choice**: 128 balances these factors and matches CPU page size.
+  </Accordion>
+
+  <Accordion title="Segment Size">
+    **Smaller segments** (e.g., 128 chunks):
+    - ✅ Faster freezing
+    - ❌ More Arc overhead per snapshot
+    
+    **Larger segments** (e.g., 512 chunks):
+    - ✅ Fewer Arc bumps per snapshot
+    - ❌ Longer pending phase
+    - ❌ Larger allocation when freezing
+    
+    **Choice**: 256 provides 1 MB segments, reasonable for most workloads.
+  </Accordion>
+
+  <Accordion title="Copy-on-Write Behavior">
+    **Aggressive COW** (always clone on write to shared chunk):
+    - ✅ Protects all snapshots
+    - ❌ High memory usage with many snapshots
+    
+    **Lazy COW** (only clone when necessary):
+    - ✅ Lower memory usage
+    - ❌ Complexity in tracking mutations
+    
+    **Choice**: Rust's `Arc::make_mut()` provides automatic lazy COW.
+  </Accordion>
+</AccordionGroup>
+
+## Testing Structural Sharing
+
+From `src/tree.rs:1122-1136`:
+
+```rust
+#[test]
+fn chunked_level_clone_shares_arcs() {
+    let mut level = ChunkedLevel::new();
+    for i in 0..CHUNK_SIZE + 5 {
+        level.push(leaf(i as u32)).unwrap();
+    }
+    let snap = level.clone();
+    
+    // The completed chunk Arc is shared
+    assert!(Chunk::ptr_eq(level.get_chunk(0), snap.get_chunk(0)));
+    
+    // Data matches
+    for i in 0..level.len() {
+        assert_eq!(level.get(i).unwrap(), snap.get(i).unwrap());
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Storage Modes" icon="database" href="./storage-modes">
+    Learn about persistent storage with WAL and checkpointing
+  </Card>
+  
+  <Card title="Memory Management" icon="memory" href="../advanced/memory-management">
+    Optimize memory usage for your workload
+  </Card>
+</CardGroup>

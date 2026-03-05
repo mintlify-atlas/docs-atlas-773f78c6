@@ -1,0 +1,172 @@
+---
+title: In-Memory Benchmarks
+description: Performance benchmarks for pure in-memory trees without persistence
+---
+
+## Overview
+
+In-memory benchmarks measure the raw computational performance of RotorTree without any disk I/O overhead. These benchmarks test `LeanIMT` — the pure in-memory variant that operates entirely in RAM.
+
+<Info>
+The in-memory benchmarks exhibit the lowest variance and highest throughput of all benchmark categories. The parallel variant achieves peak throughput up to **~190M leaves/sec**.
+</Info>
+
+## Single-Threaded (`tree_bench.rs`)
+
+The single-threaded benchmark suite tests `LeanIMT` with `default-features = false` (no concurrency, no parallelism).
+
+### Insertion Patterns
+
+#### Single Insert
+
+Inserts leaves one-by-one using `tree.insert(leaf)`:
+
+- **Counts**: 1K, 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Per-insertion overhead and incremental root updates
+
+```rust
+for &leaf in &leaves {
+    tree.insert(leaf).unwrap();
+}
+```
+
+#### Batch Insert
+
+Inserts all leaves in a single `insert_many` call:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Batch optimization effectiveness
+
+```rust
+tree.insert_many(&leaves).unwrap();
+```
+
+#### Chunked Insert
+
+Inserts leaves in fixed-size chunks (100 or 1000 leaves per chunk):
+
+- **Counts**: 10K, 100K, 1M leaves
+- **Chunk sizes**: 100, 1000
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Real-world batching patterns (e.g., blockchain blocks)
+
+```rust
+for chunk in leaves.chunks(100) {
+    tree.insert_many(chunk).unwrap();
+}
+```
+
+#### Incremental Insert
+
+Pre-populates tree with N/2 leaves, then inserts remaining N/2:
+
+- **Counts**: 10K, 100K, 1M leaves (total)
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Performance on large existing trees
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, N, 32>::new(Blake3Hasher);
+tree.insert_many(first_half).unwrap();
+// benchmark:
+tree.insert_many(second_half).unwrap();
+```
+
+### Proof Operations
+
+#### Generate Proof
+
+Generates a proof for the middle leaf in a pre-populated tree:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Proof generation latency as tree size scales
+
+```rust
+let snap = tree.snapshot();
+snap.generate_proof(count / 2).unwrap();
+```
+
+#### Verify Proof
+
+Verifies a proof for the first leaf:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Verification latency (constant-time expected)
+
+```rust
+let proof = snap.generate_proof(0).unwrap();
+proof.verify(&tree_hasher).unwrap();
+```
+
+<Note>
+Proof verification latency is nearly constant across tree sizes, as shown in the [proof latency graph](https://github.com/rymnc/rotortree/blob/main/assets/no_mmap_vs_mmap.png).
+</Note>
+
+## Parallel (`tree_bench_parallel.rs`)
+
+The parallel benchmark suite tests `LeanIMT` with the `parallel` feature enabled, which uses [rayon](https://github.com/rayon-rs/rayon) to parallelize hash computation in `insert_many`.
+
+### Key Differences
+
+- **Rayon initialization**: Each benchmark warms up the thread pool with `rayon::broadcast(|_| {})`
+- **Parallelism threshold**: Controlled by `ROTORTREE_PARALLEL_THRESHOLD` (default 1024 parents)
+- **Work unit size**: Controlled by `PAR_CHUNK_SIZE` (default 64 parents per rayon job)
+
+### Benchmark Variants
+
+- **Batch Insert**: Same as single-threaded, but parallelized
+- **Chunked Insert (100)**: 100 leaves per chunk
+- **Chunked Insert (1000)**: 1000 leaves per chunk
+- **Incremental Insert**: Pre-populated tree, parallelized second half
+
+### Peak Throughput
+
+<Info>
+The parallel in-memory benchmark achieves peak throughput up to **~190M leaves/sec** with low variance. This represents the upper bound of RotorTree's computational performance.
+</Info>
+
+### When to Use Parallel
+
+- **Large batches**: Parallelism overhead only pays off for large `insert_many` calls (>1K leaves)
+- **Multi-core systems**: Maximum benefit on systems with many cores
+- **Predictable batches**: Works best with consistent batch sizes
+
+### When to Use Single-Threaded
+
+<Info>
+If you have a low number of insertions or require predictable latency under load, the single-threaded variant has **much better variance characteristics**. It trades absolute throughput for predictability.
+</Info>
+
+## Tuning Parameters
+
+You can adjust these parameters to optimize for your workload:
+
+### Runtime (Environment Variables)
+
+- `ROTORTREE_PARALLEL_THRESHOLD` (default `1024`): Minimum parent count before rayon kicks in
+
+### Compile-Time (Source Code)
+
+- `CHUNK_SIZE` (default `128`): Hashes per structural sharing chunk (affects snapshot copy cost)
+- `CHUNKS_PER_SEGMENT` (default `256`): Chunks per immutable segment
+- `PAR_CHUNK_SIZE` (default `64`): Parents per rayon work unit
+
+<Note>
+Changing compile-time constants requires recompiling RotorTree. Start with environment variables first.
+</Note>
+
+## Running the Benchmarks
+
+```bash
+# Single-threaded
+cargo bench --bench tree_bench
+
+# Parallel (requires 'parallel' feature)
+cargo bench --bench tree_bench_parallel --features parallel
+
+# List all in-memory benchmarks
+cargo bench --bench tree_bench -- --list
+```

@@ -1,0 +1,97 @@
+---
+title: Benchmark Overview
+description: Performance benchmarking approach and methodology for RotorTree
+---
+
+## Benchmark Suite
+
+RotorTree includes a comprehensive benchmark suite with ~380 benchmarks covering different workload patterns and configurations. All benchmarks are driven by [divan](https://github.com/nvzqz/divan) and [crabtime](https://github.com/zakstucke/crabtime) for reliable performance measurements.
+
+## Test Environment
+
+All benchmark results documented here were collected on:
+
+- **CPU**: Apple M4 Pro (14 cores)
+- **Memory**: 48 GB
+- **OS**: macOS
+
+<Note>
+Your results may vary based on hardware, OS, and system load. Always benchmark your specific workload on your target environment.
+</Note>
+
+## Benchmark Categories
+
+The benchmark suite is organized into four main categories:
+
+<CardGroup cols={2}>
+  <Card title="In-Memory" icon="memory" href="./in-memory">
+    Single-threaded and parallel insertion benchmarks for pure in-memory trees
+  </Card>
+  <Card title="Storage" icon="database" href="./storage">
+    WAL persistence, checkpoint, recovery, and mmap tiering benchmarks
+  </Card>
+  <Card title="Concurrent" icon="arrows-spin" href="./concurrent">
+    Concurrent read/write workloads with lock-based coordination
+  </Card>
+</CardGroup>
+
+## Branching Factors
+
+All benchmarks test four branching factors: **N=2, 4, 8, 16**. The branching factor affects:
+
+- Tree depth (higher N = shallower tree)
+- Hash computation per level (higher N = more hashes per node)
+- Storage layout (higher N = better disk block utilization)
+- Proof size (higher N = fewer siblings per level)
+
+## Measurement Approach
+
+### Throughput
+
+Insertion benchmarks report throughput as **leaves/second**. Each benchmark:
+
+- Measures time to insert a specific number of leaves
+- Uses `divan::counter::ItemsCount` to calculate items/sec
+- Excludes setup time (tree creation, temp directory allocation)
+
+### Latency
+
+Proof generation and verification benchmarks measure **latency per operation**. See the [proof latency graph](https://github.com/rymnc/rotortree/blob/main/assets/no_mmap_vs_mmap.png) for mmap vs no-mmap comparison.
+
+### Variance
+
+<Info>
+The pure in-memory benchmark (`tree_bench_parallel`) exhibits **low variance** and achieves peak throughput up to **~190M leaves/sec**. 
+
+The single-threaded variant (`tree_bench`) has the **best variance characteristics** — useful when predictability under load is a constraint, though at lower absolute throughput.
+</Info>
+
+## Interactive Results
+
+Full benchmark results with detailed charts and comparison tools are available at:
+
+**https://rymnc.github.io/rotortree/benchmarks**
+
+The interactive dashboard includes:
+
+- Time-series performance trends
+- Branching factor comparisons
+- Workload scaling analysis
+- Statistical variance visualization
+
+## Benchmark Source Code
+
+All benchmarks live in `benches/` in the RotorTree repository:
+
+- `tree_bench.rs` - Single-threaded in-memory
+- `tree_bench_parallel.rs` - Parallel in-memory (rayon)
+- `tree_bench_storage.rs` - WAL persistence and recovery
+- `tree_bench_concurrent.rs` - Concurrent read/write workloads
+- `tree_bench_all.rs` - Combined suite
+
+Run locally with:
+
+```bash
+cargo bench -- --list  # list all benchmarks
+cargo bench            # run all benchmarks
+```

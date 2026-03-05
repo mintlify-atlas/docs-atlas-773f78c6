@@ -1,0 +1,688 @@
+---
+title: 'Storage Modes'
+description: 'In-memory vs. persistent storage with WAL, checkpointing, and tiered mmap in RotorTree'
+---
+
+## Storage Modes Overview
+
+RotorTree supports two distinct storage modes:
+
+1. **In-Memory Mode** (`LeanIMT`): Pure in-memory tree with no persistence
+2. **Persistent Mode** (`RotorTree`): WAL-based persistence with optional mmap tiering
+
+<Note>
+Most use cases only need in-memory mode with a bootstrapping sync mechanism. Persistent mode adds overhead and complexity.
+</Note>
+
+## In-Memory Mode (`LeanIMT`)
+
+### Configuration
+
+**Crate features**: None (default)
+
+```toml
+[dependencies]
+rotortree = { version = "*", default-features = false }
+```
+
+**Optional features**:
+- `concurrent`: Internal `RwLock` for `&self` methods
+- `parallel`: Rayon parallelism for batch insertions
+- `wincode`: Wincode serialization for proofs
+
+### Usage
+
+From `src/tree.rs:710-731` and `README.md:55-80`:
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher, TreeHasher};
+
+// Single-threaded
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Single insert
+let leaf = [1u8; 32];
+let root = tree.insert(leaf)?;
+
+// Batch insert
+let leaves: Vec<[u8; 32]> = (0..1000).map(|i| {
+    let mut h = [0u8; 32];
+    h[..4].copy_from_slice(&i.to_le_bytes());
+    h
+}).collect();
+let root = tree.insert_many(&leaves)?;
+
+// Proof generation
+let snap = tree.snapshot();
+let proof = snap.generate_proof(0)?;
+let th = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&th)?);
+```
+
+### Characteristics
+
+| Aspect | Behavior |
+|--------|----------|
+| **Durability** | None - data lost on crash/shutdown |
+| **Startup** | Instant (empty tree) |
+| **Memory** | All data in RAM |
+| **Concurrency** | Single-threaded (or `RwLock` with `concurrent` feature) |
+| **Performance** | Best - no I/O overhead |
+| **Variance** | Low - predictable performance |
+
+<Info>
+The single-threaded variant has the best performance characteristic in terms of variance, useful when predictability under load is a constraint.
+</Info>
+
+### When to Use
+
+✅ **Good for:**
+- Ephemeral trees (session-based)
+- Trees that can be rebuilt from canonical source (blockchain)
+- Low insertion rates with predictability requirements
+- Testing and development
+
+❌ **Not suitable for:**
+- Crash recovery requirements
+- Long-running trees without external state
+- Compliance/audit requirements for persistence
+
+## Persistent Mode (`RotorTree`)
+
+### Configuration
+
+**Crate features**: `storage` (requires `std`)
+
+```toml
+[dependencies]
+rotortree = { version = "*", features = ["storage"] }
+```
+
+### Architecture
+
+From `src/storage/mod.rs:408-418`:
+
+```rust
+pub struct RotorTree<H: Hasher, const N: usize, const MAX_DEPTH: usize> {
+    shared: Arc<Shared<H, N, MAX_DEPTH>>,
+    flush_handle: Option<FlushHandle>,      // Background flush thread
+    checkpoint_handle: Option<CheckpointHandle>, // Background checkpoint thread
+}
+```
+
+**Components**:
+
+1. **WAL (Write-Ahead Log)**: Append-only log of insertions
+2. **Data Files**: Materialized tree state from checkpoints
+3. **Flush Thread**: Periodic fsync to disk
+4. **Checkpoint Thread**: Materializes WAL to data files
+
+### File Structure
+
+From `src/storage/checkpoint.rs` and `src/storage/mod.rs`:
+
+```
+/tmp/my-tree/
+├── wal                          # Write-ahead log (append-only)
+├── data/
+│   ├── header.bin               # Tree configuration (N, MAX_DEPTH, CHUNK_SIZE)
+│   ├── checkpoint.meta          # Checkpoint metadata (leaf_count, root_hash, etc.)
+│   ├── tails.bin                # All level tail buffers
+│   ├── level_0/
+│   │   ├── shard_0000.dat       # Chunks 0-65535 (256 MB)
+│   │   ├── shard_0001.dat       # Chunks 65536-131071
+│   │   └── ...
+│   ├── level_1/
+│   │   ├── shard_0000.dat
+│   │   └── ...
+│   └── ...
+```
+
+### Configuration
+
+From `src/storage/mod.rs:56-68`:
+
+```rust
+pub struct RotorTreeConfig {
+    pub path: PathBuf,
+    pub flush_policy: FlushPolicy,
+    pub checkpoint_policy: CheckpointPolicy,
+    pub tiering: TieringConfig,
+    pub verify_checkpoint: bool,
+}
+```
+
+### Flush Policies
+
+From `src/storage/mod.rs:70-82`:
+
+```rust
+pub enum FlushPolicy {
+    /// Fsync on a periodic interval (default: 10ms)
+    Interval(Duration),
+    /// Caller controls flushing via `flush()`
+    Manual,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self::Interval(Duration::from_millis(10))
+    }
+}
+```
+
+**Behavior**:
+
+- **`Interval(duration)`**: Background thread fsyncs every `duration`
+  - Lower latency: fsyncs more often (e.g., 1ms)
+  - Lower overhead: fsyncs less often (e.g., 100ms)
+  - Default: 10ms balances both
+
+- **`Manual`**: Application calls `tree.flush()` explicitly
+  - Useful for blockchain followers (flush after each block)
+  - Lower CPU overhead
+  - Requires careful integration
+
+### Checkpoint Policies
+
+From `src/storage/checkpoint.rs:40-50`:
+
+```rust
+pub enum CheckpointPolicy {
+    Manual,
+    EveryNEntries(u64),
+    MemoryThreshold(usize),
+    OnClose,
+}
+```
+
+| Policy | Trigger | Use Case |
+|--------|---------|----------|
+| `Manual` | Explicit `checkpoint()` call | Full control, batch processing |
+| `EveryNEntries(n)` | After every N WAL entries | Bounded WAL size |
+| `MemoryThreshold(bytes)` | When uncheckpointed memory exceeds bytes | Bounded memory usage |
+| `OnClose` | Only on graceful shutdown | Long-running, minimal I/O |
+
+**From `src/storage/mod.rs:375-386`**:
+
+```rust
+fn should_auto_checkpoint(&self) -> bool {
+    match &self.checkpoint_policy {
+        CheckpointPolicy::Manual | CheckpointPolicy::OnClose => false,
+        CheckpointPolicy::EveryNEntries(n) => {
+            self.entries_since_checkpoint.load(Ordering::Relaxed) as u64 >= *n
+        },
+        CheckpointPolicy::MemoryThreshold(bytes) => {
+            self.uncheckpointed_memory_bytes.load(Ordering::Relaxed) >= *bytes
+        },
+    }
+}
+```
+
+### Tiering Configuration
+
+From `src/storage/checkpoint.rs:58-71`:
+
+```rust
+pub struct TieringConfig {
+    /// Levels below this value have their committed chunks mmap'd after checkpoint.
+    /// Set to `usize::MAX` to mmap all levels (default), `0` to keep everything in memory
+    pub pin_above_level: usize,
+}
+
+impl Default for TieringConfig {
+    fn default() -> Self {
+        Self { pin_above_level: usize::MAX }
+    }
+}
+```
+
+**Behavior**:
+
+- `pin_above_level = 0`: Keep all levels in memory (no mmap)
+- `pin_above_level = 3`: Mmap levels 0-2, keep levels 3+ in memory
+- `pin_above_level = usize::MAX`: Mmap all levels (default)
+
+<Warning>
+Reads from mmap'd levels incur page faults if not in page cache. Set `pin_above_level` carefully based on access patterns.
+</Warning>
+
+### Usage Example
+
+From `README.md:88-128`:
+
+```rust
+use rotortree::{
+    Blake3Hasher, RotorTree, RotorTreeConfig, TreeHasher,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+};
+use std::{path::PathBuf, time::Duration};
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    flush_policy: FlushPolicy::default(), // fsync every 10ms
+    checkpoint_policy: CheckpointPolicy::default(), // manual
+    tiering: TieringConfig::default(), // all in memory
+    verify_checkpoint: true, // recompute root on recovery
+};
+
+// Opens existing WAL or creates a new one
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config)?;
+
+// Insert: returns root + a durability token
+let (root, token) = tree.insert([42u8; 32])?;
+// token.wait() blocks until the entry is fsynced
+
+// Or insert + wait for fsync in one call
+let root = tree.insert_durable([43u8; 32])?;
+
+// Batch insert
+let leaves = vec![[1u8; 32]; 500];
+let (root, token) = tree.insert_many(&leaves)?;
+
+// Lock-free snapshot for proof generation (same as in-memory)
+let snap = tree.snapshot();
+let proof = snap.generate_proof(0)?;
+let th = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&th)?);
+
+// Explicit flush & close
+tree.flush()?;
+tree.close()?;
+// (also flushes + releases file lock on drop)
+```
+
+## Write-Ahead Log (WAL)
+
+### WAL Format
+
+From `src/storage/wal.rs`:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Header (on file creation)                           │
+│ ┌─────────┬───────────────┬────────────┐           │
+│ │ Magic   │ N (u32)       │ MAX_DEPTH  │           │
+│ │ (4 bytes)│ branching     │ (u32)      │           │
+│ └─────────┴───────────────┴────────────┘           │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ Entry 0 (seq=0)                                     │
+│ ┌──────────────────────────────────────────┐       │
+│ │ Frame: CRC32 | Length | Payload | CRC32  │       │
+│ │   Payload: seq (u64) | WalPayload        │       │
+│ │     WalPayload::Single([u8; 32])          │       │
+│ │     or WalPayload::Batch(Vec<[u8; 32]>)   │       │
+│ └──────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│ Entry 1 (seq=1)                                     │
+│ ...                                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+### WAL Operations
+
+**Write Path** (from `src/storage/mod.rs:524-551`):
+
+```rust
+pub fn insert(&self, leaf: Hash) -> Result<(Hash, DurabilityToken), RotorTreeError> {
+    let (root, token) = {
+        let mut state = self.shared.state.lock();
+        
+        // 1. Update in-memory tree
+        let root = LeanIMT::_insert(&mut state.inner, &self.shared.hasher, leaf)?;
+        
+        // 2. Serialize to WAL buffer
+        let seq = state.next_seq;
+        wal::serialize_entry(&mut state.buffer, seq, wal::WalPayload::Single(leaf));
+        state.next_seq += 1;
+        
+        // 3. Update snapshot
+        let snap = state.inner.snapshot();
+        self.shared.snapshot.store(Arc::new(snap));
+        
+        // 4. Return durability token
+        let token = self.shared.durability.token(seq);
+        (root, token)
+    };
+    
+    self.maybe_auto_checkpoint();
+    Ok((root, token))
+}
+```
+
+**Flush Path** (from `src/storage/mod.rs:134-193`):
+
+```rust
+fn flush_inner(&self) -> Result<(), StorageError> {
+    let wal_file = self.wal_file.lock();
+    let (buf, last_seq) = {
+        let mut state = self.state.lock();
+        if state.buffer.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut state.buffer);
+        let last_seq = state.next_seq.saturating_sub(1);
+        (buf, last_seq)
+    };
+    
+    // Write + fsync
+    wal_file.write_all(&buf)?;
+    wal_file.sync_data()?;
+    
+    // Mark durable
+    self.durability.mark_flushed(last_seq);
+    Ok(())
+}
+```
+
+**Recovery Path** (from `src/storage/recovery.rs`):
+
+```rust
+fn recover<H, F, const N: usize, const MAX_DEPTH: usize>(
+    file: &mut F,
+    hasher: &TreeHasher<H>,
+) -> Result<RecoveryResult<N, MAX_DEPTH>, StorageError>
+where
+    H: Hasher,
+    F: Read + Seek,
+{
+    // 1. Read and validate header
+    let (n, max_depth) = wal::read_header(file)?;
+    
+    // 2. Replay all entries
+    let mut inner = TreeInner::new();
+    let mut next_seq = 0;
+    
+    while let Some((seq, payload)) = wal::read_entry(file)? {
+        match payload {
+            WalPayload::Single(leaf) => {
+                LeanIMT::_insert(&mut inner, hasher, leaf)?;
+            },
+            WalPayload::Batch(leaves) => {
+                LeanIMT::_insert_many(&mut inner, hasher, &leaves)?;
+            },
+        }
+        next_seq = seq + 1;
+    }
+    
+    Ok(RecoveryResult { inner, next_seq })
+}
+```
+
+## Checkpointing
+
+### Checkpoint Process
+
+From `src/storage/mod.rs:227-373`:
+
+```rust
+fn checkpoint_inner(&self) -> Result<(), StorageError> {
+    let mut wal_file = self.wal_file.lock();
+    let mut state = self.state.lock();
+    
+    // 1. Flush WAL buffer
+    self.flush_buffer_locked(&wal_file, &mut state)?;
+    
+    // 2. Capture checkpoint snapshot
+    let snap = /* capture tree state, new chunks per level, tails */;
+    
+    // 3. Write new chunks to data files
+    for (level_idx, level_data) in snap.level_data.iter().enumerate() {
+        if !level_data.new_chunks.is_empty() {
+            append_chunks_to_level(
+                &self.data_dir,
+                level_idx,
+                level_data.from_chunk,
+                level_data.new_chunks.iter(),
+            )?;
+        }
+    }
+    
+    // 4. Fsync all data files
+    for file in &files_to_sync {
+        file.sync_data()?;
+    }
+    
+    // 5. Write tails atomically
+    checkpoint::write_tails(&self.data_dir, &tails, MAX_DEPTH)?;
+    
+    // 6. Write metadata atomically
+    checkpoint::write_meta(&self.data_dir, &meta)?;
+    
+    // 7. Truncate WAL
+    wal.seek(SeekFrom::Start(0))?;
+    wal.write_all(&header_buf)?;
+    wal.set_len(header_buf.len() as u64)?;
+    wal.sync_data()?;
+    
+    // 8. Remap chunks if tiering enabled
+    if level_idx < self.tiering.pin_above_level {
+        let regions = checkpoint::mmap_level_shards(&self.data_dir, level_idx, chunk_count)?;
+        state.inner.levels[level_idx].remap_chunks(chunk_count, &regions);
+    }
+    
+    Ok(())
+}
+```
+
+**Atomicity**: Checkpoint metadata is written last. If the process crashes before metadata write, the old checkpoint remains valid.
+
+### Checkpoint Files
+
+**Header** (`header.bin`):
+
+```rust
+struct HeaderFrame {
+    magic: [u8; 4],     // "RTRD"
+    n: u32,
+    max_depth: u32,
+    chunk_size: u32,
+}
+```
+
+**Metadata** (`checkpoint.meta`):
+
+```rust
+struct CheckpointMeta {
+    magic: [u8; 4],     // "RTMD"
+    n: u32,
+    max_depth: u32,
+    last_wal_seq: u64,  // Last WAL entry included in checkpoint
+    leaf_count: u64,
+    depth: u32,
+    root_hash: Hash,
+}
+```
+
+**Data Shards** (`level_N/shard_XXXX.dat`):
+
+From `src/storage/checkpoint.rs:30-31`:
+
+```rust
+const CHUNK_BYTE_SIZE: usize = CHUNK_SIZE * 32;  // 128 × 32 = 4 KB
+const CHUNKS_PER_SHARD: usize = 65_536;          // 65536 × 4 KB = 256 MB
+```
+
+Each shard file is up to 256 MB of contiguous chunk data.
+
+## Memory-Mapped Storage
+
+### Remapping After Checkpoint
+
+From `src/storage/mod.rs:330-343`:
+
+```rust
+if snapshot_total > 0 && level_idx < self.tiering.pin_above_level {
+    let regions = checkpoint::mmap_level_shards(
+        &self.data_dir,
+        level_idx,
+        snapshot_total,
+    )?;
+    if !regions.is_empty() {
+        state.inner.levels[level_idx].remap_chunks(snapshot_total, &regions);
+    }
+}
+```
+
+**Remap Process** (from `src/tree.rs:443-480`):
+
+```rust
+fn remap_chunks(&mut self, count: usize, regions: &[Arc<MmapRegion>]) {
+    let total = self.chunk_count();
+    let remap_count = count.min(total);
+    
+    // Save unmapped chunks
+    let mut unmapped = Vec::new();
+    for chunk_idx in remap_count..total {
+        unmapped.push(self.get_chunk(chunk_idx).clone());
+    }
+    
+    // Clear segments and pending
+    self.segments.clear();
+    self.pending.clear();
+    
+    // Create mapped chunks for checkpointed data
+    for chunk_idx in 0..remap_count {
+        let (shard_idx, offset) = shard_address(chunk_idx);
+        let mapped_chunk = Chunk::new_mapped(Arc::clone(&regions[shard_idx]), offset);
+        self.push_chunk(mapped_chunk);
+    }
+    
+    // Re-add unmapped chunks
+    for chunk in unmapped {
+        self.push_chunk(chunk);
+    }
+}
+```
+
+### Memory-Mapped Chunks
+
+From `src/tree.rs:85-93`:
+
+```rust
+fn as_slice(&self) -> &[Hash; CHUNK_SIZE] {
+    match &self.0 {
+        ChunkInner::Memory(arc) => arc,
+        ChunkInner::Mapped { region, offset } => {
+            // SAFETY: offset validated at construction
+            unsafe { &*(region.as_ptr().add(*offset).cast::<[Hash; CHUNK_SIZE]>()) }
+        }
+    }
+}
+```
+
+**Behavior**:
+- Reads directly from mmap'd region (OS handles paging)
+- Writes trigger copy-on-write to memory
+- Transparently falls back to page cache
+
+## Performance Comparison
+
+From `README.md:235-244` and benchmark results:
+
+### In-Memory (No Mmap)
+
+- **Throughput**: ~190M leaves/sec (parallel)
+- **Variance**: Low (single-threaded)
+- **Proof latency**: Constant (~10-50μs)
+- **Memory**: All data in RAM
+
+### Persistent (Full Mmap)
+
+- **Throughput**: ~10-50M leaves/sec (depends on I/O)
+- **Variance**: Higher (I/O dependent)
+- **Proof latency**: Variable (page cache dependent)
+- **Memory**: Configurable via tiering
+
+### Benchmark: Proof Latency vs Tree Size
+
+From `README.md:237-243`:
+
+```
+Test: 1B leaves, 1M chunks, manual checkpoint after each chunk
+Platform: M4 Pro, 14c, 48GB
+
+No mmap (pin_above_level=0):
+- Proof generation: ~50μs (constant)
+- Verification: ~30μs (constant)
+- Memory: ~37 GB
+
+Full mmap (pin_above_level=usize::MAX):
+- Proof generation: ~100-500μs (varies with page cache)
+- Verification: ~30μs (constant)
+- Memory: ~2 GB (resident), 37 GB (mapped)
+```
+
+<Info>
+Proof verification is constant time regardless of storage mode (only hashes root path).
+</Info>
+
+## Recommendations
+
+<AccordionGroup>
+  <Accordion title="For Development">
+    Use in-memory mode:
+    ```toml
+    rotortree = { version = "*", default-features = false }
+    ```
+  </Accordion>
+
+  <Accordion title="For Blockchain Followers">
+    Use persistent mode with manual flushing:
+    ```rust
+    RotorTreeConfig {
+        flush_policy: FlushPolicy::Manual,
+        checkpoint_policy: CheckpointPolicy::Manual,
+        tiering: TieringConfig { pin_above_level: 0 }, // all in memory
+        verify_checkpoint: true,
+    }
+    
+    // Flush after each block
+    tree.flush()?;
+    
+    // Checkpoint periodically (e.g., every 100 blocks)
+    if block_height % 100 == 0 {
+        tree.checkpoint()?;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="For Large Trees">
+    Use tiering to control memory:
+    ```rust
+    RotorTreeConfig {
+        flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+        checkpoint_policy: CheckpointPolicy::MemoryThreshold(10 * 1024 * 1024 * 1024), // 10 GB
+        tiering: TieringConfig { pin_above_level: 3 }, // mmap levels 0-2
+        verify_checkpoint: true,
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="For High Throughput">
+    Use in-memory mode with parallel feature:
+    ```toml
+    rotortree = { version = "*", features = ["parallel"] }
+    ```
+    
+    ```bash
+    export ROTORTREE_PARALLEL_THRESHOLD=512
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Proof Generation" icon="shield-check" href="../features/proof-generation">
+    Generate and verify inclusion and consistency proofs
+  </Card>
+  
+  <Card title="Benchmarking" icon="chart-line" href="../advanced/benchmarking">
+    Measure performance for your workload
+  </Card>
+</CardGroup>

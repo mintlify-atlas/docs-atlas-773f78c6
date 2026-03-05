@@ -1,0 +1,256 @@
+---
+title: Branching Factor
+description: Choosing the optimal N parameter for your use case
+---
+
+The branching factor `N` is one of the most important parameters in RotorTree. It determines how many children each internal node can have, fundamentally affecting tree depth, proof size, and performance characteristics.
+
+## Overview
+
+RotorTree implements an n-ary Lean Incremental Merkle Tree where `N` is the branching factor:
+
+```rust
+let tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+//                                 ^  ^^^
+//                                 N  MAX_DEPTH
+```
+
+<Note>
+`N` must be at least 2. Common values are 2, 4, 8, and 16.
+</Note>
+
+## Depth vs Width Tradeoff
+
+The branching factor creates a fundamental tradeoff:
+
+**Higher N (wider trees):**
+- ✅ Shallower trees (fewer hash layers)
+- ✅ Shorter Merkle proofs
+- ✅ Better cache locality (more children per node)
+- ❌ More children to hash per node
+- ❌ Larger memory per node update
+
+**Lower N (narrower trees):**
+- ✅ Fewer children to hash per node
+- ✅ Smaller individual hash operations
+- ❌ Deeper trees (more hash layers)
+- ❌ Longer Merkle proofs
+- ❌ More levels to traverse
+
+## Capacity Calculations
+
+The maximum number of leaves a tree can hold is determined by:
+
+```
+capacity = N^MAX_DEPTH
+```
+
+For a given number of leaves `L`, the actual depth is:
+
+```
+depth = ⌈log_N(L)⌉
+```
+
+### Common Configurations
+
+<CardGroup cols={2}>
+  <Card title="N=2 (Binary)" icon="binary">
+    Classic binary Merkle tree
+    - MAX_DEPTH=20: **1,048,576** leaves
+    - MAX_DEPTH=25: **33,554,432** leaves
+    - MAX_DEPTH=30: **1,073,741,824** leaves
+  </Card>
+  
+  <Card title="N=4 (Quaternary)" icon="grid-2">
+    Balanced performance
+    - MAX_DEPTH=10: **1,048,576** leaves
+    - MAX_DEPTH=13: **67,108,864** leaves
+    - MAX_DEPTH=16: **4,294,967,296** leaves (~4.3B)
+  </Card>
+  
+  <Card title="N=8 (Octonary)" icon="grid">
+    Wide trees, shallow depth
+    - MAX_DEPTH=7: **2,097,152** leaves
+    - MAX_DEPTH=10: **1,073,741,824** leaves (~1B)
+    - MAX_DEPTH=13: **549,755,813,888** leaves
+  </Card>
+  
+  <Card title="N=16 (Hexadecimal)" icon="grid-2-plus">
+    Maximum width
+    - MAX_DEPTH=5: **1,048,576** leaves
+    - MAX_DEPTH=8: **4,294,967,296** leaves (~4.3B)
+    - MAX_DEPTH=10: **1,099,511,627,776** leaves (~1T)
+  </Card>
+</CardGroup>
+
+### Storage Examples from README
+
+With the `storage` feature enabled:
+
+**N=4, MAX_DEPTH=16:**
+- Capacity: ~4.3 billion nullifiers
+- Disk usage: 41 GiB
+
+**N=8, MAX_DEPTH=10:**
+- Capacity: ~1 billion nullifiers
+- Disk usage: 37 GiB
+
+<Tip>
+For most use cases, using a new tree per generation and encoding nullifiers with the generation is more practical than building extremely large trees.
+</Tip>
+
+## Proof Size Impact
+
+Merkle proof size is directly affected by tree depth:
+
+```
+proof_size ≈ depth × 32 bytes × siblings_per_level
+```
+
+For a tree with `L` leaves:
+
+| N | Depth for 1M leaves | Depth for 1B leaves | Proof size (1M) | Proof size (1B) |
+|---|---------------------|---------------------|-----------------|------------------|
+| 2 | 20                  | 30                  | ~640 bytes      | ~960 bytes       |
+| 4 | 10                  | 15                  | ~960 bytes      | ~1440 bytes      |
+| 8 | 7                   | 10                  | ~1344 bytes     | ~1920 bytes      |
+| 16| 5                   | 8                   | ~1920 bytes     | ~3072 bytes      |
+
+<Note>
+Actual proof size depends on the Merkle proof format and includes additional metadata.
+</Note>
+
+## ZK Prover Circuit Costs
+
+From the README, circuit costs scale with both `N` and depth `d = ⌈log_N(num_leaves)⌉`:
+
+### Jolt Execution Cycles
+
+```
+cycles ≈ 2948.4 + 1832.9 × N × MAX_DEPTH + (899.5 + 2993.8N - 103.4N²) × d
+```
+
+### Noir Circuit Size (UltraHonk)
+
+```
+expression_width = 68 + (217N - 100) × d
+circuit_size = 2962 + 30N + (551N² + 2629N - 2448) × d
+```
+
+**Key insight:** Higher `N` reduces `d` but increases the per-level cost. Optimal `N` depends on your prover and constraint system.
+
+## Choosing N for Your Use Case
+
+### Privacy Protocols (Low to Medium Throughput)
+
+**Recommended: N=2 or N=4**
+
+```rust
+let tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+```
+
+- Proof compatibility with existing binary tree circuits
+- Reasonable depth for proof generation
+- Good balance for verification
+
+### High-Throughput Nullifier Databases
+
+**Recommended: N=8 or N=16**
+
+```rust
+let tree = LeanIMT::<Blake3Hasher, 8, 12>::new(Blake3Hasher);
+```
+
+- Minimizes depth for faster insertions
+- Better parallelization with wider nodes
+- Reduces tree traversal overhead
+
+### ZK Circuit Compatibility
+
+**Recommended: N=2 or N=4**
+
+```rust
+let tree = LeanIMT::<Blake3Hasher, 2, 25>::new(Blake3Hasher);
+```
+
+- Easier to prove in constraint systems
+- Better support in existing ZK libraries
+- Lower per-node circuit complexity
+
+### In-Memory Only (No Persistence)
+
+**Recommended: N=4 or N=8**
+
+```rust
+let tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+```
+
+- Optimize for insertion throughput
+- Cache-friendly chunk sizes
+- Good structural sharing characteristics
+
+<Tip>
+The single-threaded variant (without `concurrent` or `parallel` features) has the best performance characteristics in terms of variance for small to medium workloads.
+</Tip>
+
+## Empirical Guidance
+
+Based on the README benchmark notes:
+
+> The pure in-memory benchmark (tree_bench_parallel) exhibits lesser variance and achieves peak throughput up to ~190M leaves/sec with parallel features enabled.
+
+**For predictability under load:**
+- Use single-threaded mode
+- Choose N=4 or N=8
+- Trade raw throughput for consistent latency
+
+**For maximum throughput:**
+- Enable `parallel` feature
+- Choose N=8 or N=16
+- Accept higher variance
+
+## Example Calculations
+
+Let's say you need to support 10 million nullifiers:
+
+```
+Required capacity: 10,000,000 leaves
+
+N=2: depth = ⌈log₂(10M)⌉ = 24 → MAX_DEPTH ≥ 24
+N=4: depth = ⌈log₄(10M)⌉ = 12 → MAX_DEPTH ≥ 12
+N=8: depth = ⌈log₈(10M)⌉ = 8  → MAX_DEPTH ≥ 8
+N=16: depth = ⌈log₁₆(10M)⌉ = 6 → MAX_DEPTH ≥ 6
+```
+
+**Recommendation:** Use `N=4, MAX_DEPTH=16` for headroom and good balance.
+
+## Runtime Behavior
+
+The tree depth grows dynamically as leaves are inserted:
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+tree.insert(leaf).unwrap();
+assert_eq!(tree.depth(), 0); // 1 leaf, depth 0
+
+for _ in 0..3 {
+    tree.insert(leaf).unwrap();
+}
+assert_eq!(tree.depth(), 1); // 4 leaves, depth 1
+
+for _ in 0..12 {
+    tree.insert(leaf).unwrap();
+}
+assert_eq!(tree.depth(), 2); // 16 leaves, depth 2
+```
+
+<Warning>
+Once `depth` reaches `MAX_DEPTH`, further insertions will fail with `TreeError::MaxDepthExceeded`.
+</Warning>
+
+## Related Topics
+
+- [Configuration](/optimization/configuration) - Tuning compile-time constants
+- [Batch Operations](/optimization/batch-operations) - Optimizing bulk insertions
+- [Benchmarks](https://rymnc.github.io/rotortree/benchmarks) - Performance data for different configurations

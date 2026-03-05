@@ -1,0 +1,231 @@
+---
+title: TreeError
+description: Core tree operation errors
+---
+
+## Overview
+
+`TreeError` represents errors that occur during tree operations such as insertions, updates, and proof generation. These are logical errors related to tree constraints and operations.
+
+```rust
+pub enum TreeError {
+    MaxDepthExceeded { max_depth: usize },
+    IndexOutOfRange { index: u64, size: u64 },
+    EmptyBatch,
+    CapacityExceeded,
+    MathError,
+    InvalidProofDepth { expected: usize, actual: usize },
+    NoUpdateNeeded,
+}
+```
+
+## Error Variants
+
+<Accordion title="MaxDepthExceeded">
+  **Returned when:** An operation would cause the tree to exceed its compile-time maximum depth.
+  
+  ```rust
+  TreeError::MaxDepthExceeded { max_depth: usize }
+  ```
+  
+  The `max_depth` field indicates the configured maximum depth that would be violated.
+  
+  **Common causes:**
+  - Inserting too many leaves for the configured `MAX_DEPTH`
+  - Tree capacity exhausted for the given depth limit
+  
+  **Recovery strategy:**
+  - Increase `MAX_DEPTH` at compile time if possible
+  - Split data across multiple trees
+</Accordion>
+
+<Accordion title="IndexOutOfRange">
+  **Returned when:** Attempting to access a leaf index outside the valid range `[0, size)`.
+  
+  ```rust
+  TreeError::IndexOutOfRange { index: u64, size: u64 }
+  ```
+  
+  The error includes both the requested `index` and the current tree `size`.
+  
+  **Common causes:**
+  - Accessing a leaf that hasn't been inserted yet
+  - Using an incorrect index calculation
+  - Stale size information
+  
+  **Recovery strategy:**
+  - Validate indices before access
+  - Check current tree size with `tree.size()`
+</Accordion>
+
+<Accordion title="EmptyBatch">
+  **Returned when:** `insert_many` is called with an empty slice.
+  
+  ```rust
+  TreeError::EmptyBatch
+  ```
+  
+  **Common causes:**
+  - Passing an empty vector or slice to batch insertion
+  - Logic error in batch preparation
+  
+  **Recovery strategy:**
+  - Validate batch is non-empty before calling `insert_many`
+  - Handle empty batches separately in application logic
+</Accordion>
+
+<Accordion title="CapacityExceeded">
+  **Returned when:** The tree's `u64` size cannot be represented as `usize`.
+  
+  ```rust
+  TreeError::CapacityExceeded
+  ```
+  
+  This indicates an internal overflow when converting between size types.
+  
+  **Common causes:**
+  - Operating on 32-bit systems with very large trees
+  - Size calculations exceeding `usize::MAX`
+  
+  **Recovery strategy:**
+  - Use a 64-bit platform for very large trees
+  - Split data across multiple trees
+</Accordion>
+
+<Accordion title="MathError">
+  **Returned when:** An internal mathematical operation fails.
+  
+  ```rust
+  TreeError::MathError
+  ```
+  
+  This is a generic error for arithmetic issues during tree operations.
+  
+  **Common causes:**
+  - Integer overflow in internal calculations
+  - Invalid arithmetic operations
+  
+  **Recovery strategy:**
+  - Report as a bug if encountered
+  - Check for edge cases in input data
+</Accordion>
+
+<Accordion title="InvalidProofDepth">
+  **Returned when:** A consistency proof has an unexpected depth.
+  
+  ```rust
+  TreeError::InvalidProofDepth { expected: usize, actual: usize }
+  ```
+  
+  The error includes both the `expected` depth and the `actual` depth received.
+  
+  **Common causes:**
+  - Proof generated for different tree configuration
+  - Corrupted or modified proof data
+  - Version mismatch between proof generation and verification
+  
+  **Recovery strategy:**
+  - Regenerate the proof with correct parameters
+  - Verify tree configurations match
+</Accordion>
+
+<Accordion title="NoUpdateNeeded">
+  **Returned when:** A proof update operation is requested but the old and new sizes are identical.
+  
+  ```rust
+  TreeError::NoUpdateNeeded
+  ```
+  
+  This indicates the update is a no-op since the tree size hasn't changed.
+  
+  **Common causes:**
+  - Calling update with `old_size == new_size`
+  - Logic error in update flow
+  
+  **Recovery strategy:**
+  - Check if sizes differ before requesting update
+  - Skip update operation for same-size transitions
+</Accordion>
+
+## Error Handling
+
+### Basic Pattern
+
+```rust
+use rotortree::TreeError;
+
+match tree.insert(leaf_hash) {
+    Ok(()) => println!("Leaf inserted successfully"),
+    Err(TreeError::MaxDepthExceeded { max_depth }) => {
+        eprintln!("Tree depth limit reached: {}", max_depth);
+    }
+    Err(TreeError::CapacityExceeded) => {
+        eprintln!("Tree capacity exceeded");
+    }
+    Err(e) => eprintln!("Tree operation failed: {}", e),
+}
+```
+
+### Validation Before Operations
+
+```rust
+// Check capacity before insertion
+let remaining_capacity = tree.max_capacity() - tree.size();
+if leaves.len() as u64 > remaining_capacity {
+    return Err(TreeError::MaxDepthExceeded { 
+        max_depth: tree.max_depth() 
+    });
+}
+
+// Validate index before access
+if index >= tree.size() {
+    return Err(TreeError::IndexOutOfRange { 
+        index, 
+        size: tree.size() 
+    });
+}
+
+// Check batch is non-empty
+if leaves.is_empty() {
+    return Err(TreeError::EmptyBatch);
+}
+
+tree.insert_many(&leaves)?;
+```
+
+### Converting to Application Errors
+
+```rust
+#[derive(Debug)]
+enum AppError {
+    TreeFull,
+    InvalidIndex(u64),
+    TreeOperation(String),
+}
+
+impl From<TreeError> for AppError {
+    fn from(e: TreeError) -> Self {
+        match e {
+            TreeError::MaxDepthExceeded { .. } => AppError::TreeFull,
+            TreeError::IndexOutOfRange { index, .. } => {
+                AppError::InvalidIndex(index)
+            }
+            _ => AppError::TreeOperation(e.to_string()),
+        }
+    }
+}
+```
+
+## Traits
+
+`TreeError` implements:
+- `Debug` - for debugging output
+- `Display` - for user-friendly error messages
+- `PartialEq`, `Eq` - for error comparison
+- `std::error::Error` - for error trait compatibility
+
+## See Also
+
+- [StorageError](/api/storage-error) - Storage and I/O errors
+- [LeanIMT](/api/lean-imt) - Main tree interface
+- [Proof Generation](/guides/proof-generation) - Working with Merkle proofs

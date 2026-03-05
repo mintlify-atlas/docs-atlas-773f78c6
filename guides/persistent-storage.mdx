@@ -1,0 +1,377 @@
+---
+title: Persistent Storage
+description: Enable WAL-based persistence with crash recovery and configurable flush policies
+---
+
+# Persistent Storage
+
+The `RotorTree` type adds write-ahead logging (WAL), checkpointing, and optional memory-mapped storage tiers to `LeanIMT`. This enables crash recovery while maintaining high throughput.
+
+## Enabling Storage
+
+Add the `storage` feature to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rotortree = { version = "0.15", features = ["storage", "blake3"] }
+```
+
+<Note>
+The `storage` feature automatically includes `parking_lot`, `arc-swap`, `wincode`, `crc-fast`, `fs4`, and `memmap2` dependencies.
+</Note>
+
+## Opening a Tree
+
+Create a `RotorTree` with configuration:
+
+```rust
+use rotortree::{
+    Blake3Hasher, RotorTree, RotorTreeConfig,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+};
+use std::path::PathBuf;
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    flush_policy: FlushPolicy::default(), // fsync every 10ms
+    checkpoint_policy: CheckpointPolicy::default(), // manual
+    tiering: TieringConfig::default(), // all in memory
+    verify_checkpoint: true, // recompute root on recovery
+};
+
+// Opens existing WAL or creates a new one
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config).unwrap();
+```
+
+## Configuration Options
+
+### Flush Policy
+
+Controls when buffered WAL entries are fsynced to disk:
+
+<CodeGroup>
+```rust Interval (Default)
+// Fsync on a background thread every 10ms
+FlushPolicy::Interval(std::time::Duration::from_millis(10))
+```
+
+```rust Manual
+// Caller controls flushing via tree.flush()
+// Works well if you're following a blockchain as canonical source
+FlushPolicy::Manual
+```
+</CodeGroup>
+
+<Warning>
+With `FlushPolicy::Manual`, you must call `tree.flush()` periodically or data will remain in memory. Unflushed data is lost on crash.
+</Warning>
+
+### Checkpoint Policy
+
+Checkpoints materialize WAL state to data files, allowing WAL truncation:
+
+<CodeGroup>
+```rust Manual (Default)
+// Caller calls tree.checkpoint() explicitly
+CheckpointPolicy::Manual
+```
+
+```rust EveryNEntries
+// Auto-checkpoint after every N WAL entries
+CheckpointPolicy::EveryNEntries(1000)
+```
+
+```rust MemoryThreshold
+// Auto-checkpoint when uncheckpointed memory exceeds threshold
+CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024) // 256 MB
+```
+
+```rust OnClose
+// Checkpoint only on graceful close
+// Fastest for write-heavy workloads
+CheckpointPolicy::OnClose
+```
+</CodeGroup>
+
+### Tiering Configuration
+
+Controls which tree levels are kept in memory vs memory-mapped:
+
+```rust
+use rotortree::TieringConfig;
+
+// Default: mmap everything after checkpoint
+let tiering = TieringConfig::default();
+assert_eq!(tiering.pin_above_level, usize::MAX);
+
+// Keep everything in memory (no mmap)
+let tiering = TieringConfig { pin_above_level: 0 };
+
+// Mmap levels 0-9, keep level 10+ in memory
+let tiering = TieringConfig { pin_above_level: 10 };
+```
+
+<Note>
+Levels **below** `pin_above_level` are mmap'd after checkpoint. Higher levels (closer to root) remain in memory for fast access.
+</Note>
+
+## Inserting with Durability
+
+RotorTree provides two insertion modes:
+
+<Tabs>
+  <Tab title="Async Durability (Fast)">
+    Returns immediately with a durability token:
+    
+    ```rust
+    let (root, token) = tree.insert([42u8; 32]).unwrap();
+    
+    // Do other work...
+    
+    // Wait for fsync to complete
+    token.wait();
+    ```
+    
+    <Note>
+    The background flush thread will fsync according to `FlushPolicy`. The token allows you to wait for durability when needed.
+    </Note>
+  </Tab>
+  
+  <Tab title="Sync Durability (Simple)">
+    Waits for fsync before returning:
+    
+    ```rust
+    let root = tree.insert_durable([43u8; 32]).unwrap();
+    // Guaranteed durable when this returns
+    ```
+  </Tab>
+</Tabs>
+
+### Batch Inserts
+
+Batch operations work the same way:
+
+```rust
+let leaves = vec![[1u8; 32]; 500];
+let (root, token) = tree.insert_many(&leaves).unwrap();
+
+// Option 1: Wait for durability
+token.wait();
+
+// Option 2: Continue and check later
+tree.insert([2u8; 32]).unwrap();
+token.wait(); // Both insertions are now durable
+```
+
+## Snapshots and Proofs
+
+Snapshots work identically to in-memory trees:
+
+```rust
+use rotortree::TreeHasher;
+
+// Lock-free snapshot
+let snap = tree.snapshot();
+
+// Generate proof (same as LeanIMT)
+let proof = snap.generate_proof(0).unwrap();
+let th = TreeHasher::new(Blake3Hasher);
+assert!(proof.verify(&th).unwrap());
+```
+
+<Note>
+Snapshots are copy-on-write and don't block insertions. Proof generation from snapshots is always lock-free.
+</Note>
+
+## Checkpointing
+
+Checkpoints write tree state to data files:
+
+```rust
+// Explicit checkpoint
+tree.checkpoint().unwrap();
+
+// Or let the policy handle it automatically
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    flush_policy: FlushPolicy::Manual,
+    checkpoint_policy: CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024),
+    tiering: TieringConfig::default(),
+    verify_checkpoint: false,
+};
+```
+
+### Checkpoint Structure
+
+Checkpoints create a directory structure:
+
+```
+/tmp/my-tree/
+  wal.log           # Write-ahead log
+  wal.lock          # File lock
+  data/
+    header.bin      # Tree metadata (N, MAX_DEPTH, CHUNK_SIZE)
+    checkpoint.meta # Latest checkpoint metadata
+    level_0/        # Leaf level
+      shard_0000.bin
+      shard_0001.bin
+    level_1/        # First parent level
+      shard_0000.bin
+    ...
+```
+
+<Note>
+Each shard file contains up to 65,536 chunks. Each chunk is 128 hashes × 32 bytes = 4 KB.
+</Note>
+
+## Closing the Tree
+
+```rust
+// Explicit flush and close
+tree.flush().unwrap();
+tree.close().unwrap();
+
+// Or just drop (also flushes + releases lock)
+drop(tree);
+```
+
+<Warning>
+Always use graceful shutdown in production. While `Drop` flushes the WAL, checkpoint-on-close only runs if you call `close()` explicitly.
+</Warning>
+
+## Recovery
+
+RotorTree automatically recovers on `open()`:
+
+```rust
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config).unwrap();
+// If WAL exists, it's replayed automatically
+```
+
+### Recovery Process
+
+<Steps>
+  <Step title="Load Checkpoint">
+    If `data/checkpoint.meta` exists, load the last checkpointed state from shard files.
+  </Step>
+  
+  <Step title="Replay WAL">
+    Replay all WAL entries since the last checkpoint sequence number.
+  </Step>
+  
+  <Step title="Verify Root (Optional)">
+    If `verify_checkpoint: true`, recompute the Merkle root to detect corruption beyond CRC.
+  </Step>
+  
+  <Step title="Truncate WAL">
+    Truncate the WAL to remove any partial entries from a crash.
+  </Step>
+</Steps>
+
+<Warning>
+**Root Verification**: Setting `verify_checkpoint: true` adds recovery time (must hash all leaves) but provides strong corruption detection. Disable for faster recovery if you trust CRC protection.
+</Warning>
+
+## Complete Example: Bulk Load
+
+Here's a realistic example from the repository:
+
+```rust
+use rotortree::{
+    Blake3Hasher, RotorTree, RotorTreeConfig, TreeHasher,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+const N: usize = 4;
+const MAX_DEPTH: usize = 14;
+
+fn main() {
+    let config = RotorTreeConfig {
+        path: PathBuf::from(".db"),
+        flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+        checkpoint_policy: CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024),
+        tiering: TieringConfig::default(),
+        verify_checkpoint: false,
+    };
+    
+    let tree = RotorTree::<Blake3Hasher, N, MAX_DEPTH>::open(
+        Blake3Hasher,
+        config
+    ).unwrap();
+    
+    // Insert 1M leaves in chunks
+    let mut inserted = 0u64;
+    let chunk_size = 10_000;
+    
+    while inserted < 1_000_000 {
+        let leaves: Vec<[u8; 32]> = (inserted..inserted + chunk_size)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        
+        let start = Instant::now();
+        let (_root, token) = tree.insert_many(&leaves).unwrap();
+        let insert_time = start.elapsed();
+        
+        token.wait();
+        let durable_time = start.elapsed();
+        
+        inserted += chunk_size;
+        
+        println!(
+            "{} leaves: insert {:.2}ms, durable {:.2}ms",
+            inserted,
+            insert_time.as_secs_f64() * 1000.0,
+            durable_time.as_secs_f64() * 1000.0
+        );
+    }
+    
+    // Generate proof
+    let snap = tree.snapshot();
+    let proof = snap.generate_proof(500_000).unwrap();
+    assert!(proof.verify(&TreeHasher::new(Blake3Hasher)).unwrap());
+    
+    tree.close().unwrap();
+    std::fs::remove_dir_all(".db").unwrap();
+}
+```
+
+## Performance Characteristics
+
+From benchmarks on M4 Pro (14 cores, 48 GB):
+
+- **1B leaves inserted in 1M chunks**
+- **Manual checkpoint after each chunk**
+- **Proof generation remains constant (~50μs)**
+- **Verification is always ~10μs**
+
+<Note>
+Proof generation time depends on snapshot acquisition cost. With mmap, cold levels are read from disk, adding latency. Pin hot levels in memory for consistent proof generation performance.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Proof Generation" icon="shield-check" href="/guides/proof-generation">
+    Learn about inclusion proofs, consistency proofs, and proof updates
+  </Card>
+  
+  <Card title="Performance Tuning" icon="gauge" href="/guides/tuning-performance">
+    Optimize checkpoint policies, tiering, and parallelism for your workload
+  </Card>
+  
+  <Card title="In-Memory Trees" icon="memory" href="/guides/in-memory-tree">
+    Compare with the faster in-memory-only LeanIMT
+  </Card>
+  
+  <Card title="Feature Flags" icon="flag" href="/guides/feature-flags">
+    Explore additional features like parallel insertion and wincode serialization
+  </Card>
+</CardGroup>

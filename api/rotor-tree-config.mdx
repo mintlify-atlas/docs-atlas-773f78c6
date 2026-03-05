@@ -1,0 +1,152 @@
+---
+title: RotorTreeConfig
+description: Configuration structure for opening a RotorTree with persistence
+---
+
+`RotorTreeConfig` controls all aspects of how a `RotorTree` persists data, including WAL flushing, checkpointing, and memory/disk tiering.
+
+## Definition
+
+Defined in `src/storage/mod.rs:56`
+
+```rust
+pub struct RotorTreeConfig {
+    pub path: PathBuf,
+    pub flush_policy: FlushPolicy,
+    pub checkpoint_policy: CheckpointPolicy,
+    pub tiering: TieringConfig,
+    pub verify_checkpoint: bool,
+}
+```
+
+## Fields
+
+<ParamField path="path" type="PathBuf" required>
+  Directory path where the WAL and data files are stored. The directory will be created if it doesn't exist.
+  
+  The structure will contain:
+  - `wal` file for write-ahead log
+  - `data/` directory for checkpoint files after the first checkpoint
+</ParamField>
+
+<ParamField path="flush_policy" type="FlushPolicy" required>
+  Controls when WAL entries are fsynced to disk.
+  
+  Options:
+  - `FlushPolicy::Interval(Duration)` - Periodic fsync (default: 10ms)
+  - `FlushPolicy::Manual` - Application controls via `flush()`
+  
+  See [FlushPolicy](/api/flush-policy) for details.
+</ParamField>
+
+<ParamField path="checkpoint_policy" type="CheckpointPolicy" required>
+  Controls when checkpoints are triggered to materialize tree state to data files.
+  
+  Options:
+  - `Manual` (default)
+  - `EveryNEntries(u64)`
+  - `MemoryThreshold(usize)`
+  - `OnClose`
+  
+  See [CheckpointPolicy](/api/checkpoint-policy) for details.
+</ParamField>
+
+<ParamField path="tiering" type="TieringConfig" required>
+  Controls which tree levels are kept in memory vs mmap'd from disk after checkpoint.
+  
+  See [TieringConfig](/api/tiering-config) for details.
+</ParamField>
+
+<ParamField path="verify_checkpoint" type="bool" required>
+  When `true`, recomputes the Merkle root on recovery to detect corruption beyond CRC checks.
+  
+  **Default:** Typically set to `true` for maximum safety.
+  
+  **Tradeoff:** Setting to `false` speeds up recovery but only relies on CRC validation.
+</ParamField>
+
+## Usage Example
+
+```rust
+use rotortree::{
+    Blake3Hasher, RotorTree, RotorTreeConfig,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+};
+use std::path::PathBuf;
+use std::time::Duration;
+
+// Configuration with automatic checkpointing
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+    checkpoint_policy: CheckpointPolicy::EveryNEntries(10_000),
+    tiering: TieringConfig::default(), // all mmap'd
+    verify_checkpoint: true,
+};
+
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config)?;
+```
+
+## Common Configurations
+
+<CardGroup cols={2}>
+<Card title="High Throughput" icon="gauge-high">
+```rust
+RotorTreeConfig {
+    path: PathBuf::from("/data/tree"),
+    flush_policy: FlushPolicy::Interval(
+        Duration::from_millis(100)
+    ), // less frequent fsync
+    checkpoint_policy: CheckpointPolicy::MemoryThreshold(
+        1_073_741_824 // 1 GiB
+    ),
+    tiering: TieringConfig { pin_above_level: 2 },
+    verify_checkpoint: false,
+}
+```
+</Card>
+
+<Card title="Maximum Safety" icon="shield-check">
+```rust
+RotorTreeConfig {
+    path: PathBuf::from("/data/tree"),
+    flush_policy: FlushPolicy::Manual, // app controls
+    checkpoint_policy: CheckpointPolicy::OnClose,
+    tiering: TieringConfig { pin_above_level: 0 }, // all memory
+    verify_checkpoint: true,
+}
+```
+</Card>
+
+<Card title="Blockchain Sync" icon="link">
+```rust
+RotorTreeConfig {
+    path: PathBuf::from("/data/tree"),
+    flush_policy: FlushPolicy::Manual,
+    checkpoint_policy: CheckpointPolicy::Manual,
+    tiering: TieringConfig::default(),
+    verify_checkpoint: true,
+}
+```
+Call `flush()` after each block, `checkpoint()` after each epoch.
+</Card>
+
+<Card title="Development" icon="code">
+```rust
+RotorTreeConfig {
+    path: PathBuf::from("/tmp/dev-tree"),
+    flush_policy: FlushPolicy::default(),
+    checkpoint_policy: CheckpointPolicy::default(),
+    tiering: TieringConfig::default(),
+    verify_checkpoint: true,
+}
+```
+</Card>
+</CardGroup>
+
+## Related
+
+- [FlushPolicy](/api/flush-policy) - WAL fsync control
+- [CheckpointPolicy](/api/checkpoint-policy) - Checkpoint triggers
+- [TieringConfig](/api/tiering-config) - Memory/disk tiering
+- [RotorTree::open()](/api/rotor-tree#open) - Opening a persistent tree

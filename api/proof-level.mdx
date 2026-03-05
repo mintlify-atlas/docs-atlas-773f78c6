@@ -1,0 +1,269 @@
+---
+title: 'ProofLevel'
+description: 'One level of an N-ary Merkle proof'
+---
+
+## Overview
+
+`ProofLevel<N>` represents one level of an N-ary Merkle inclusion proof. It contains the child position and sibling hashes needed to reconstruct the parent hash at that level.
+
+## Type Definition
+
+```rust
+pub struct ProofLevel<const N: usize> {
+    pub position: u8,
+    pub sibling_count: u8,
+    pub siblings: [Hash; N],
+}
+```
+
+## Generic Parameters
+
+<ParamField path="N" type="const usize">
+  The branching factor (arity) of the tree. Determines the size of the `siblings` array. At most `N-1` siblings are valid.
+</ParamField>
+
+## Fields
+
+<ParamField path="position" type="u8">
+  Child position within the group (`0..N-1`). Indicates which child in the parent's group is on the path from leaf to root.
+</ParamField>
+
+<ParamField path="sibling_count" type="u8">
+  Number of valid siblings in the `siblings` array. A value of `0` indicates a lifted node (a node that was promoted directly to the next level without siblings).
+</ParamField>
+
+<ParamField path="siblings" type="[Hash; N]">
+  Sibling hashes. Only the first `sibling_count` elements are valid. A `Hash` is a 32-byte array (`[u8; 32]`).
+  
+  The sibling at `position` is omitted (it's the hash being proven). Siblings before `position` are stored first, then siblings after `position`.
+</ParamField>
+
+## Derive Traits
+
+- `Debug`
+- `Clone`
+- `Copy`
+- `PartialEq`
+- `Eq`
+- `wincode::SchemaWrite` (with `wincode` feature)
+- `wincode::SchemaRead` (with `wincode` feature)
+- `serde::Serialize` (with `serde` feature)
+- `serde::Deserialize` (with `serde` feature)
+
+## Understanding the Structure
+
+### Fixed-Size Array
+
+The `siblings` array has a fixed size of `N` elements, but only the first `sibling_count` elements are valid. This design:
+
+- Avoids dynamic allocation
+- Enables stack storage
+- Supports efficient serialization
+
+### Sibling Layout
+
+For a group with `sibling_count + 1` children total, where the proven child is at `position`:
+
+```
+children[0..position] → siblings[0..position]
+children[position]    → the hash being proven (omitted)
+children[position+1..total] → siblings[position..sibling_count]
+```
+
+**Example with N=3, position=1, sibling_count=2:**
+
+```rust
+// Group has 3 children: [A, B, C]
+// B is on the path (position=1)
+// Siblings stored as: [A, C]
+ProofLevel {
+    position: 1,
+    sibling_count: 2,
+    siblings: [A, C, ...],  // ... = unused slots
+}
+```
+
+### Lifted Nodes
+
+When `sibling_count == 0`, the node has no siblings and is "lifted" directly to the next level:
+
+```rust
+ProofLevel {
+    position: 0,
+    sibling_count: 0,
+    siblings: [...],  // unused
+}
+```
+
+This occurs in non-full trees where some nodes don't have full sibling groups.
+
+## Examples
+
+### Binary Tree (N=2)
+
+```rust
+use rotortree::{LeanIMT, XorHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(0).unwrap();
+
+// Proof for leaf 0 in a 2-leaf binary tree
+let level = &proof.levels[0];
+assert_eq!(level.position, 0);         // Left child
+assert_eq!(level.sibling_count, 1);    // One sibling (leaf 1)
+assert_eq!(level.siblings[0], [2u8; 32]); // Right sibling
+```
+
+### Ternary Tree (N=3)
+
+```rust
+use rotortree::{LeanIMT, XorHasher};
+
+let mut tree = LeanIMT::<XorHasher, 3, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+tree.insert([3u8; 32]).unwrap();
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(1).unwrap();
+
+// Proof for leaf 1 in a 3-leaf ternary tree
+let level = &proof.levels[0];
+assert_eq!(level.position, 1);         // Middle child
+assert_eq!(level.sibling_count, 2);    // Two siblings
+assert_eq!(level.siblings[0], [1u8; 32]); // Left sibling
+assert_eq!(level.siblings[1], [3u8; 32]); // Right sibling
+```
+
+### Lifted Node in Binary Tree
+
+```rust
+use rotortree::{LeanIMT, XorHasher};
+
+let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+tree.insert([1u8; 32]).unwrap();
+tree.insert([2u8; 32]).unwrap();
+tree.insert([3u8; 32]).unwrap();
+
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(2).unwrap();
+
+// Leaf 2 is lifted (no sibling at level 0)
+let level = &proof.levels[0];
+assert_eq!(level.position, 0);
+assert_eq!(level.sibling_count, 0);  // Lifted
+```
+
+## Verification Process
+
+During verification, each level reconstructs the parent hash:
+
+1. **Lifted node** (`sibling_count == 0`): The hash passes through unchanged
+2. **Normal node** (`sibling_count > 0`):
+   - Create a children array of size `sibling_count + 1`
+   - Place siblings before and after the proven hash
+   - Hash all children to get the parent hash
+
+```rust
+// Pseudocode for verification at one level
+if level.sibling_count == 0 {
+    // Lifted: hash passes through
+    current_hash = current_hash;
+} else {
+    // Reconstruct parent
+    let mut children = [Hash; N];
+    
+    // Siblings before position
+    children[0..position] = level.siblings[0..position];
+    
+    // Current hash at position
+    children[position] = current_hash;
+    
+    // Siblings after position
+    let rest = sibling_count - position;
+    children[position+1..position+1+rest] = 
+        level.siblings[position..position+rest];
+    
+    // Hash to get parent
+    current_hash = hasher.hash_children(&children[..sibling_count+1]);
+}
+```
+
+## Memory Layout
+
+For a `ProofLevel<N>` struct:
+
+- `position`: 1 byte
+- `sibling_count`: 1 byte
+- `siblings`: 32 × N bytes
+- **Total**: 2 + 32N bytes
+
+**Size examples:**
+- `ProofLevel<2>`: 66 bytes
+- `ProofLevel<3>`: 98 bytes
+- `ProofLevel<4>`: 130 bytes
+- `ProofLevel<8>`: 258 bytes
+
+## Serialization
+
+### With `wincode` feature
+
+The entire fixed-size array is serialized, including unused slots. This is efficient for binary formats.
+
+```rust
+use rotortree::ProofLevel;
+
+let level: ProofLevel<2> = /* ... */;
+let bytes = wincode::serialize(&level)?;
+let decoded: ProofLevel<2> = wincode::deserialize(&bytes)?;
+```
+
+### With `serde` feature
+
+The `serde` feature uses `serde_with` to serialize the fixed-size array. The entire array is serialized.
+
+```rust
+use rotortree::ProofLevel;
+
+let level: ProofLevel<2> = /* ... */;
+let json = serde_json::to_string(&level)?;
+let decoded: ProofLevel<2> = serde_json::from_str(&json)?;
+```
+
+## Validation Rules
+
+Valid proof levels must satisfy:
+
+1. `position < N`
+2. `sibling_count < N` (at most N-1 siblings)
+3. `position < sibling_count + 1` (position must be within the group)
+4. If `sibling_count == 0`, the node is lifted (no validation of siblings)
+
+These rules are enforced during proof verification in `NaryProof::verify`.
+
+## Related Types
+
+### ConsistencyLevel
+
+For consistency proofs, a similar structure exists:
+
+```rust
+pub struct ConsistencyLevel<const N: usize> {
+    pub shared_count: u8,
+    pub new_count: u8,
+    pub hashes: [Hash; N],
+}
+```
+
+This contains both shared hashes (from the old tree) and new-only hashes (added in the new tree).
+
+## See Also
+
+- [NaryProof](/api/nary-proof) - Contains an array of ProofLevels
+- [ConsistencyProof](/api/consistency-proof) - Uses ConsistencyLevel instead
+- [TreeSnapshot](/api/tree-snapshot) - Generates proofs containing ProofLevels

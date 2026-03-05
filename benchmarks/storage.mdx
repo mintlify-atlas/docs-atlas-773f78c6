@@ -1,0 +1,205 @@
+---
+title: Storage Benchmarks
+description: Performance benchmarks for WAL persistence, checkpoint, and mmap tiering
+---
+
+## Overview
+
+Storage benchmarks measure the performance of `RotorTree` — the persistent variant with write-ahead logging (WAL), checkpointing, and optional mmap tiering for cold data.
+
+<Info>
+All storage benchmarks use `FlushPolicy::Manual` to isolate insertion performance from fsync overhead. In production, you'd typically use `FlushPolicy::Interval` with a background fsync thread.
+</Info>
+
+## Test Configuration
+
+All benchmarks in `tree_bench_storage.rs` use:
+
+- **FlushPolicy**: `Manual` (no automatic fsync)
+- **CheckpointPolicy**: `Manual` or `EveryNEntries` (varies by benchmark)
+- **TieringConfig**: `default()` (all in memory, mmap only after checkpoint)
+- **verify_checkpoint**: `true` (recompute root on recovery)
+
+## Insertion Benchmarks
+
+### Single Insert
+
+Inserts leaves one-by-one to the WAL:
+
+- **Counts**: 1K, 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: WAL append overhead per insertion
+
+```rust
+for &leaf in &leaves {
+    tree.insert(leaf).unwrap();  // returns (root, durability_token)
+}
+```
+
+<Note>
+This benchmark does **not** wait for fsync (no `token.wait()`). It measures in-memory insertion + WAL append, not durability latency.
+</Note>
+
+### Batch Insert
+
+Inserts all leaves in a single `insert_many` call:
+
+- **Counts**: 1K, 10K, 100K, 1M leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Batch WAL write efficiency
+
+```rust
+tree.insert_many(&leaves).unwrap();  // single WAL entry
+```
+
+## WAL Operations
+
+### Flush
+
+Measures fsync latency for flushing buffered WAL entries to disk:
+
+- **Counts**: 1K, 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: fsync overhead after batch insertion
+
+```rust
+// setup: insert leaves without flush
+tree.insert_many(&leaves).unwrap();
+
+// benchmark:
+tree.flush().unwrap();  // fsync WAL
+```
+
+<Info>
+Flush latency depends heavily on OS page cache behavior and storage device characteristics (SSD vs HDD, IOPS, etc.).
+</Info>
+
+### Open/Recovery
+
+Measures time to open an existing tree and replay the WAL:
+
+- **Counts**: 1K, 10K, 100K leaves
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Crash recovery time (WAL replay + optional root verification)
+
+```rust
+// setup: create tree, insert leaves, flush, close
+{
+    let tree = RotorTree::open(hasher, config).unwrap();
+    tree.insert_many(&leaves).unwrap();
+    tree.flush().unwrap();
+    tree.close().unwrap();
+}
+
+// benchmark:
+let tree = RotorTree::open(hasher, config).unwrap();  // replays WAL
+```
+
+## Checkpoint Benchmarks
+
+### Sustained Checkpoint
+
+Measures performance under continuous insertion + checkpointing + proof generation:
+
+- **Counts**: 100K, 1M leaves (inserted in 10K chunks)
+- **Checkpoint frequency**: Every 5, 25, 100, or 500 WAL entries
+- **Branching factors**: N=2, 4, 8, 16
+- **What it measures**: Realistic sustained workload with automatic checkpointing
+
+```rust
+for chunk in leaves.chunks(10_000) {
+    tree.insert_many(chunk).unwrap();
+    
+    // generate 3 proofs: oldest, midpoint, newest
+    let snap = tree.snapshot();
+    snap.generate_proof(0).unwrap();
+    snap.generate_proof(size / 2).unwrap();
+    snap.generate_proof(size - 1).unwrap();
+    
+    // checkpoint may trigger based on policy
+}
+```
+
+<Note>
+This benchmark simulates a blockchain node that:
+1. Processes blocks in batches
+2. Checkpoints periodically to prevent unbounded WAL growth
+3. Serves proof requests for historical leaves
+</Note>
+
+## Mixed Workload
+
+Measures performance of a realistic mixed workload:
+
+1. Pre-populate with 10K leaves
+2. Flush to disk
+3. Insert N more leaves (100, 1K, 10K, or 100K)
+4. Get current root
+5. Generate proof for middle leaf
+6. Verify proof
+
+**Tick sizes**: 100, 1K, 10K, 100K leaves
+
+This simulates a typical "process new block + serve proof request" pattern.
+
+## Mmap Tiering
+
+### Configuration
+
+The `TieringConfig` controls which tree levels stay in memory vs get mmap'd from data files after checkpoint:
+
+```rust
+pub struct TieringConfig {
+    pub pin_above_level: usize,
+}
+```
+
+- `pin_above_level: usize::MAX` (default): mmap everything after checkpoint
+- `pin_above_level: 0`: keep everything in memory (no mmap)
+- `pin_above_level: L`: levels > L stay in memory, levels ≤ L get mmap'd
+
+<Info>
+Writes always go to WAL + memory. Reads are always from memory or mmap. You cannot do an apples-to-apples comparison with other Merkle tree databases that read from disk on every query.
+</Info>
+
+### Capacity Examples
+
+- **N=4, MAX_DEPTH=16**: ~4.3B nullifiers in 41 GiB
+- **N=8, MAX_DEPTH=10**: ~1B nullifiers in 37 GiB
+
+### Performance Comparison
+
+The README includes a detailed benchmark comparing no-mmap vs full-mmap performance:
+
+**Test setup**:
+- m4 pro, 14c, 48gig
+- 1B leaves inserted in 1M chunks
+- Manual checkpoint after each chunk insertion
+
+![Proof Latency vs Tree Size](https://github.com/rymnc/rotortree/blob/main/assets/no_mmap_vs_mmap.png)
+
+**Key findings**:
+- Proof verification is nearly constant (always reading from memory/mmap)
+- Proof generation varies based on snapshot acquisition cost
+- Mmap adds latency for cold data access but enables much larger trees
+
+<Note>
+For most use cases, you don't need crash persistence if there's a bootstrapping sync mechanism. Just use the single-threaded in-memory variant — it's **MUCH** faster with lower variance for small to medium workloads.
+</Note>
+
+## Running the Benchmarks
+
+```bash
+# All storage benchmarks (requires 'storage' feature)
+cargo bench --bench tree_bench_storage --features storage
+
+# With parallelism
+cargo bench --bench tree_bench_storage --features storage,parallel
+
+# List all storage benchmarks
+cargo bench --bench tree_bench_storage --features storage -- --list
+```
+
+<Warning>
+Storage benchmarks create temporary directories and write real data to disk. Make sure you have sufficient disk space and avoid running on systems with strict I/O limits.
+</Warning>

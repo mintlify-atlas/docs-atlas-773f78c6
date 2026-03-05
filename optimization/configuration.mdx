@@ -1,0 +1,164 @@
+---
+title: Configuration
+description: Compile-time constants and runtime environment variables for tuning RotorTree performance
+---
+
+RotorTree provides several configuration options to tune performance for your specific workload. These are split into compile-time constants (requiring recompilation) and runtime environment variables.
+
+## Compile-Time Constants
+
+These constants are defined in `src/tree.rs` and require modifying the source code and recompiling to change.
+
+### CHUNK_SIZE
+
+```rust
+const CHUNK_SIZE: usize = 128;
+```
+
+Number of hashes per chunk for structural sharing.
+
+**Impact:**
+- `128 × 32 bytes = 4 KB` per chunk
+- Affects snapshot copy cost (larger chunks = fewer Arc clones)
+- Controls Arc granularity for copy-on-write operations
+- 4 KB aligns well with typical memory page sizes
+
+**When to adjust:**
+- Increase for workloads with frequent snapshots and large trees
+- Decrease if memory pressure is high or working with many small trees
+
+### CHUNKS_PER_SEGMENT
+
+```rust
+const CHUNKS_PER_SEGMENT: usize = 256;
+```
+
+Number of chunks per immutable segment.
+
+**Impact:**
+- Controls how many chunks are frozen into a single Arc slab
+- `256 chunks × 128 hashes × 32 bytes = 1 MB` per segment
+- Affects structural sharing granularity at a higher level than CHUNK_SIZE
+
+**When to adjust:**
+- Increase for better batch operation performance on large datasets
+- Decrease to reduce memory footprint per segment
+
+### PAR_CHUNK_SIZE
+
+```rust
+// Only with 'parallel' feature
+const PAR_CHUNK_SIZE: usize = 64;
+```
+
+Number of parent nodes per Rayon work unit during parallel batch operations.
+
+**Impact:**
+- Smaller values = more parallelism but higher scheduling overhead
+- Larger values = less overhead but coarser parallelism
+- Default `64` balances work distribution and overhead
+
+**When to adjust:**
+- Decrease on systems with many CPU cores (32+) for finer work distribution
+- Increase on systems with fewer cores or high context-switching costs
+- Benchmark with your specific hardware and batch sizes
+
+<Note>
+Requires the `parallel` feature to be enabled.
+</Note>
+
+### MAX_FRAME_PAYLOAD
+
+```rust
+// Only with 'storage' feature
+const MAX_FRAME_PAYLOAD: u32 = 128 * 1024 * 1024; // 128 MB
+```
+
+Maximum WAL/checkpoint frame payload size.
+
+**Impact:**
+- Limits the size of a single `insert_many` batch that can be persisted
+- `128 MB ÷ 32 bytes = 4,194,304` leaves per batch maximum
+- Prevents unbounded memory usage during serialization
+
+**When to adjust:**
+- Increase if you need to insert more than 4M leaves in a single batch
+- Decrease to reduce memory spikes during WAL writes
+
+<Warning>
+Changing this value will make existing WAL/checkpoint files incompatible.
+</Warning>
+
+## Runtime Environment Variables
+
+### ROTORTREE_PARALLEL_THRESHOLD
+
+```bash
+export ROTORTREE_PARALLEL_THRESHOLD=1024
+```
+
+**Default:** `1024`
+
+**Feature:** Requires the `parallel` feature
+
+Minimum parent count before Rayon parallelism kicks in during `insert_many` operations.
+
+**Impact:**
+- Below this threshold: sequential processing (lower overhead)
+- At or above: parallel processing with Rayon (higher throughput)
+- Prevents parallelization overhead on small batches
+
+**Tuning guidance:**
+```bash
+# For CPU-bound workloads on many cores
+export ROTORTREE_PARALLEL_THRESHOLD=512
+
+# For latency-sensitive workloads
+export ROTORTREE_PARALLEL_THRESHOLD=2048
+
+# Always parallelize (testing only)
+export ROTORTREE_PARALLEL_THRESHOLD=1
+```
+
+<Tip>
+Benchmark with your actual workload to find the optimal threshold. The single-threaded variant often has better performance characteristics (lower variance) for small batches.
+</Tip>
+
+## Type Parameters
+
+The tree structure itself is controlled by const generic parameters:
+
+```rust
+LeanIMT<H: Hasher, const N: usize, const MAX_DEPTH: usize>
+```
+
+### N (Branching Factor)
+
+Must be `>= 2`. Controls the tree width.
+
+Common values: `2`, `4`, `8`, `16`
+
+See [Branching Factor](/optimization/branching-factor) for detailed guidance.
+
+### MAX_DEPTH
+
+Must be `>= 1`. Controls the maximum tree depth.
+
+Determines maximum capacity: `N^MAX_DEPTH` leaves
+
+See [Branching Factor](/optimization/branching-factor) for capacity calculations.
+
+## Benchmarking Your Configuration
+
+```bash
+# List all available benchmarks
+cargo bench -- --list
+
+# Run tree benchmarks with current configuration
+cargo bench --bench tree_bench
+
+# Run parallel benchmarks (requires 'parallel' feature)
+cargo bench --bench tree_bench_parallel --features parallel
+```
+
+Refer to the [benchmark results](https://rymnc.github.io/rotortree/benchmarks) for ~380 benchmark configurations across different parameters.

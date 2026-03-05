@@ -1,0 +1,473 @@
+---
+title: 'RotorTree'
+description: 'Durable Merkle tree with WAL and checkpointing'
+---
+
+## Type Definition
+
+```rust
+pub struct RotorTree<H: Hasher, const N: usize, const MAX_DEPTH: usize>
+```
+
+Wraps a `LeanIMT` with persistence via write-ahead logging (WAL) and optional checkpointing. Insertions are buffered in memory and periodically flushed to disk. Checkpoints materialize the tree state to data files, enabling WAL truncation and mmap-backed reads.
+
+### Generic Parameters
+
+<ParamField path="H" type="Hasher" required>
+  Hash function implementing the `Hasher` trait
+</ParamField>
+
+<ParamField path="N" type="usize" required>
+  Branching factor (compile-time constant, must be ≥ 2)
+</ParamField>
+
+<ParamField path="MAX_DEPTH" type="usize" required>
+  Maximum tree depth (compile-time constant, must be ≥ 1)
+</ParamField>
+
+<Note>
+Requires the `storage` feature to be enabled.
+</Note>
+
+## Configuration
+
+### RotorTreeConfig
+
+```rust
+pub struct RotorTreeConfig {
+    pub path: PathBuf,
+    pub flush_policy: FlushPolicy,
+    pub checkpoint_policy: CheckpointPolicy,
+    pub tiering: TieringConfig,
+    pub verify_checkpoint: bool,
+}
+```
+
+<ParamField path="path" type="PathBuf" required>
+  Directory path where WAL and data files are stored
+</ParamField>
+
+<ParamField path="flush_policy" type="FlushPolicy" required>
+  Controls when WAL entries are fsynced to disk
+</ParamField>
+
+<ParamField path="checkpoint_policy" type="CheckpointPolicy" required>
+  Controls when checkpoints are triggered
+</ParamField>
+
+<ParamField path="tiering" type="TieringConfig" required>
+  Controls which tree levels are kept in memory vs mmap'd
+</ParamField>
+
+<ParamField path="verify_checkpoint" type="bool" required>
+  Whether to recompute the Merkle root on recovery to detect corruption beyond CRC
+</ParamField>
+
+### FlushPolicy
+
+```rust
+pub enum FlushPolicy {
+    Interval(Duration),
+    Manual,
+}
+```
+
+<ParamField path="Interval" type="Duration">
+  Fsync on a periodic interval (default: 10ms)
+</ParamField>
+
+<ParamField path="Manual">
+  Caller controls flushing via `flush()`
+</ParamField>
+
+### CheckpointPolicy
+
+```rust
+pub enum CheckpointPolicy {
+    Manual,
+    OnClose,
+    EveryNEntries(u64),
+    MemoryThreshold(usize),
+}
+```
+
+<ParamField path="Manual">
+  Checkpoints only when explicitly requested via `checkpoint()`
+</ParamField>
+
+<ParamField path="OnClose">
+  Checkpoint automatically when the tree is closed
+</ParamField>
+
+<ParamField path="EveryNEntries" type="u64">
+  Checkpoint after every N WAL entries
+</ParamField>
+
+<ParamField path="MemoryThreshold" type="usize">
+  Checkpoint when uncheckpointed memory exceeds N bytes
+</ParamField>
+
+### TieringConfig
+
+```rust
+pub struct TieringConfig {
+    pub pin_above_level: usize,
+}
+```
+
+<ParamField path="pin_above_level" type="usize">
+  Levels at or above this index are kept in memory; lower levels are mmap'd from checkpoint files
+</ParamField>
+
+<Info>
+Memory-mapping lower tree levels reduces resident memory for large trees while maintaining fast access to hot data at upper levels.
+</Info>
+
+## Constructor
+
+### open
+
+```rust
+pub fn open(hasher: H, config: RotorTreeConfig) -> Result<Self, RotorTreeError>
+```
+
+Opens or creates a `RotorTree` at the given path. If data files from a previous checkpoint exist, loads state from them and replays only the WAL delta. Otherwise, replays the full WAL.
+
+<ParamField path="hasher" type="H" required>
+  The hash function to use
+</ParamField>
+
+<ParamField path="config" type="RotorTreeConfig" required>
+  Configuration for persistence behavior
+</ParamField>
+
+<ResponseField name="return" type="Result<RotorTree<H, N, MAX_DEPTH>, RotorTreeError>">
+  A new or recovered tree instance
+</ResponseField>
+
+**Errors:**
+- `RotorTreeError::Storage(StorageError::FileLocked)` if another process holds the lock
+- `RotorTreeError::Storage(StorageError::Io(_))` for I/O failures
+- `RotorTreeError::Tree(_)` for tree operation failures during recovery
+
+```rust Example
+use rotortree::{
+    RotorTree, RotorTreeConfig, FlushPolicy, CheckpointPolicy, TieringConfig,
+    adapters::blake3::Blake3Hasher,
+};
+use std::path::PathBuf;
+use std::time::Duration;
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/rotortree"),
+    flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+    checkpoint_policy: CheckpointPolicy::EveryNEntries(10000),
+    tiering: TieringConfig { pin_above_level: 3 },
+    verify_checkpoint: true,
+};
+
+let tree = RotorTree::<Blake3Hasher, 2, 32>::open(Blake3Hasher, config)?;
+```
+
+## Methods
+
+### insert
+
+```rust
+pub fn insert(&self, leaf: Hash) -> Result<(Hash, DurabilityToken), RotorTreeError>
+```
+
+Inserts a single leaf and returns the new root along with a durability token.
+
+<ParamField path="leaf" type="Hash" required>
+  The 32-byte hash to insert
+</ParamField>
+
+<ResponseField name="return" type="Result<(Hash, DurabilityToken), RotorTreeError>">
+  A tuple of the new root hash and a durability token for waiting on flush
+</ResponseField>
+
+```rust Example
+let (root, token) = tree.insert([1u8; 32])?;
+
+// Optionally wait for the entry to be fsynced
+tree.flush()?;
+token.wait();
+```
+
+<Info>
+The durability token allows callers to wait for the insertion to be fsynced to disk without blocking the insertion path.
+</Info>
+
+### insert_many
+
+```rust
+pub fn insert_many(
+    &self,
+    leaves: &[Hash],
+) -> Result<(Hash, DurabilityToken), RotorTreeError>
+```
+
+Inserts multiple leaves in a batch and returns the new root.
+
+<ParamField path="leaves" type="&[Hash]" required>
+  Slice of 32-byte hashes to insert
+</ParamField>
+
+<ResponseField name="return" type="Result<(Hash, DurabilityToken), RotorTreeError>">
+  A tuple of the new root hash and a durability token
+</ResponseField>
+
+```rust Example
+let leaves = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+let (root, token) = tree.insert_many(&leaves)?;
+```
+
+### insert_durable
+
+```rust
+pub fn insert_durable(&self, leaf: Hash) -> Result<Hash, RotorTreeError>
+```
+
+Inserts a single leaf and blocks until it is durable (fsynced).
+
+<ParamField path="leaf" type="Hash" required>
+  The 32-byte hash to insert
+</ParamField>
+
+<ResponseField name="return" type="Result<Hash, RotorTreeError>">
+  The new root hash after the insertion is fsynced
+</ResponseField>
+
+```rust Example
+let root = tree.insert_durable([1u8; 32])?;
+// At this point, the insertion is guaranteed to be on disk
+```
+
+<Warning>
+This method blocks the calling thread until fsync completes. Use `insert` + `flush` + `token.wait()` for more control over when to block.
+</Warning>
+
+### root
+
+```rust
+pub fn root(&self) -> Option<Hash>
+```
+
+Returns the current Merkle root, or `None` if the tree is empty.
+
+<ResponseField name="return" type="Option<Hash>">
+  The 32-byte root hash
+</ResponseField>
+
+### size
+
+```rust
+pub fn size(&self) -> u64
+```
+
+Returns the number of leaves in the tree.
+
+<ResponseField name="return" type="u64">
+  The leaf count
+</ResponseField>
+
+### depth
+
+```rust
+pub fn depth(&self) -> usize
+```
+
+Returns the current depth (hash layers above the leaf level).
+
+<ResponseField name="return" type="usize">
+  The tree depth
+</ResponseField>
+
+### snapshot
+
+```rust
+pub fn snapshot(&self) -> Arc<TreeSnapshot<N, MAX_DEPTH>>
+```
+
+Returns a lock-free immutable snapshot for proof generation.
+
+<ResponseField name="return" type="Arc<TreeSnapshot<N, MAX_DEPTH>>">
+  An `Arc`-wrapped snapshot
+</ResponseField>
+
+```rust Example
+let snapshot = tree.snapshot();
+let proof = snapshot.generate_proof(0)?;
+```
+
+### flush
+
+```rust
+pub fn flush(&self) -> Result<(), StorageError>
+```
+
+Flushes all buffered WAL entries to disk and fsyncs.
+
+<ResponseField name="return" type="Result<(), StorageError>">
+  Ok on success, or an error if flush fails
+</ResponseField>
+
+```rust Example
+tree.insert([1u8; 32])?;
+tree.flush()?;
+// Now the insertion is durable
+```
+
+<Info>
+With `FlushPolicy::Interval`, flush is called automatically on a background thread. Manual flush is useful with `FlushPolicy::Manual` or when you need immediate durability.
+</Info>
+
+### checkpoint
+
+```rust
+pub fn checkpoint(&self) -> Result<(), StorageError>
+```
+
+Writes a checkpoint to materialize the current tree state to data files and truncates the WAL.
+
+<ResponseField name="return" type="Result<(), StorageError>">
+  Ok on success, or an error if checkpointing fails
+</ResponseField>
+
+```rust Example
+tree.checkpoint()?;
+// WAL is now truncated, and tree state is in checkpoint files
+```
+
+<Note>
+Checkpointing is I/O-intensive. Automatic checkpointing (via `CheckpointPolicy`) runs on a background thread to avoid blocking insertions.
+</Note>
+
+### wait_for_checkpoint
+
+```rust
+pub fn wait_for_checkpoint(&self, timeout: Duration) -> bool
+```
+
+Blocks until a background checkpoint completes or the timeout expires.
+
+<ParamField path="timeout" type="Duration" required>
+  Maximum time to wait
+</ParamField>
+
+<ResponseField name="return" type="bool">
+  `true` if a checkpoint completed within the timeout, `false` otherwise
+</ResponseField>
+
+```rust Example
+use std::time::Duration;
+
+if tree.wait_for_checkpoint(Duration::from_secs(10)) {
+    println!("Checkpoint completed");
+} else {
+    println!("Timeout waiting for checkpoint");
+}
+```
+
+### close
+
+```rust
+pub fn close(self) -> Result<(), StorageError>
+```
+
+Closes the tree, flushing all pending data and optionally checkpointing (if `CheckpointPolicy::OnClose`).
+
+<ResponseField name="return" type="Result<(), StorageError>">
+  Ok on success, or an error if close operations fail
+</ResponseField>
+
+```rust Example
+tree.close()?;
+// All background threads stopped, data flushed
+```
+
+<Info>
+`close` is also called automatically in the `Drop` implementation, but explicit close allows handling errors.
+</Info>
+
+## Error Handling
+
+### RotorTreeError
+
+```rust
+pub enum RotorTreeError {
+    Storage(StorageError),
+    Tree(TreeError),
+}
+```
+
+### StorageError
+
+```rust
+pub enum StorageError {
+    Io(std::io::Error),
+    Closed,
+    FileLocked,
+    FlushFailed(Arc<std::io::Error>),
+    CheckpointFailed(String),
+    MathError,
+    // ... other variants
+}
+```
+
+## Recovery
+
+On `open`, RotorTree:
+1. Acquires an exclusive file lock on the WAL
+2. Reads the latest checkpoint metadata (if any)
+3. Memory-maps checkpointed tree levels
+4. Replays WAL entries since the checkpoint
+5. Optionally recomputes the root if `verify_checkpoint` is true
+
+If the WAL is corrupted or incomplete, recovery stops at the last valid entry.
+
+```rust Recovery Example
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/rotortree"),
+    flush_policy: FlushPolicy::Manual,
+    checkpoint_policy: CheckpointPolicy::Manual,
+    tiering: TieringConfig { pin_above_level: 2 },
+    verify_checkpoint: true,
+};
+
+// First session
+{
+    let tree = RotorTree::<Blake3Hasher, 2, 32>::open(Blake3Hasher, config.clone())?;
+    for i in 0..1000 {
+        tree.insert([i as u8; 32])?;
+    }
+    tree.flush()?;
+    tree.checkpoint()?;
+    tree.close()?;
+}
+
+// Second session - recovers from checkpoint
+{
+    let tree = RotorTree::<Blake3Hasher, 2, 32>::open(Blake3Hasher, config)?;
+    assert_eq!(tree.size(), 1000);
+}
+```
+
+## Performance Tips
+
+<Card title="Use insert_many for Batches" icon="bolt">
+  Batch insertions with `insert_many` are significantly faster than repeated `insert` calls, especially with the `parallel` feature.
+</Card>
+
+<Card title="Configure Flush Policy" icon="clock">
+  `FlushPolicy::Interval(Duration::from_millis(100))` provides a good balance between durability and throughput. Increase the interval for higher write throughput at the cost of larger unflushed windows.
+</Card>
+
+<Card title="Tune Checkpoint Policy" icon="database">
+  `CheckpointPolicy::MemoryThreshold(100_000_000)` (100MB) limits memory growth while avoiding excessive checkpoint overhead. Adjust based on your memory budget and recovery time tolerance.
+</Card>
+
+<Card title="Use Tiering for Large Trees" icon="layer-group">
+  Set `pin_above_level` to keep hot data in memory and mmap cold data. For a binary tree with billions of leaves, `pin_above_level: 5` keeps the top 5 levels in RAM (~64 nodes) while lower levels are mmap'd.
+</Card>

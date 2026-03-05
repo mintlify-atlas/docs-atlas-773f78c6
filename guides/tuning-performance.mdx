@@ -1,0 +1,629 @@
+---
+title: Performance Tuning
+description: Optimize RotorTree for your workload with compile-time and runtime configuration
+---
+
+# Performance Tuning
+
+RotorTree provides extensive tuning knobs at both compile-time and runtime. This guide covers all optimization techniques for different workloads.
+
+## Performance Overview
+
+From benchmarks on M4 Pro (14 cores, 48 GB RAM):
+
+<CardGroup cols={3}>
+  <Card title="Single-Threaded" icon="gauge">
+    ~1-2M leaves/sec
+    
+    **Best for:** Low variance, predictable latency
+  </Card>
+  
+  <Card title="Parallel (8 cores)" icon="bolt">
+    ~10-20M leaves/sec
+    
+    **Best for:** Balanced throughput/latency
+  </Card>
+  
+  <Card title="Parallel (14 cores)" icon="rocket">
+    ~190M leaves/sec peak
+    
+    **Best for:** Maximum throughput
+  </Card>
+</CardGroup>
+
+<Note>
+Single-threaded mode has the **best performance characteristic in terms of variance**. Use it when latency predictability matters more than raw throughput.
+</Note>
+
+## Compile-Time Constants
+
+These require modifying source code and recompiling. Located in `src/tree.rs`:
+
+### CHUNK_SIZE (Default: 128)
+
+```rust
+pub(crate) const CHUNK_SIZE: usize = 128;
+```
+
+**What it does:**
+- Defines hashes per chunk for structural sharing
+- Each chunk = `CHUNK_SIZE × 32 bytes` = 4 KB (default)
+
+**Tradeoffs:**
+- **Larger (256)**: Fewer Arc allocations, lower snapshot cost, coarser copy-on-write granularity
+- **Smaller (64)**: Finer-grained sharing, higher snapshot cost, more Arc overhead
+
+**When to change:**
+- Increase to 256 if you take many snapshots and want lower memory overhead
+- Decrease to 64 if you rarely snapshot and want finer CoW granularity
+
+### CHUNKS_PER_SEGMENT (Default: 256)
+
+```rust
+const CHUNKS_PER_SEGMENT: usize = 256;
+```
+
+**What it does:**
+- Controls how many chunks are frozen into a single Arc slab
+- Each segment = `CHUNKS_PER_SEGMENT × CHUNK_SIZE × 32 bytes` = 1 MB (default)
+
+**Tradeoffs:**
+- **Larger (512)**: Fewer allocations, longer freezing pauses
+- **Smaller (128)**: More frequent allocations, smoother latency
+
+**When to change:**
+- Increase for batch-heavy workloads
+- Decrease for interactive workloads with latency constraints
+
+### PAR_CHUNK_SIZE (Default: 64)
+
+```rust
+#[cfg(feature = "parallel")]
+const PAR_CHUNK_SIZE: usize = 64;
+```
+
+**What it does:**
+- Defines parents per rayon work unit
+- Smaller = more parallelism, more scheduling overhead
+
+**Tradeoffs:**
+- **Larger (128)**: Less overhead, coarser parallelism
+- **Smaller (32)**: Finer parallelism, better load balancing, more overhead
+
+**When to change:**
+- Increase for machines with fewer cores (4-8)
+- Decrease for machines with many cores (16+)
+
+### MAX_FRAME_PAYLOAD (Default: 128 MB)
+
+```rust
+const MAX_FRAME_PAYLOAD: usize = 128 * 1024 * 1024;
+```
+
+**What it does:**
+- Maximum WAL/checkpoint frame payload size
+- Limits `insert_many` batch size
+
+**When to change:**
+- Increase if you insert more than 128 MB of leaves in a single batch
+- Formula: `batch_size × 32 bytes ≤ MAX_FRAME_PAYLOAD`
+- Default allows ~4M leaves per batch
+
+<Warning>
+Increasing `MAX_FRAME_PAYLOAD` increases memory usage for WAL buffering. Ensure you have sufficient RAM.
+</Warning>
+
+## Runtime Configuration
+
+### ROTORTREE_PARALLEL_THRESHOLD (Default: 1024)
+
+Controls when parallelism kicks in:
+
+```bash
+export ROTORTREE_PARALLEL_THRESHOLD=2048
+cargo run --release --features parallel
+```
+
+**What it does:**
+- Minimum parent count before rayon parallelism is used
+- Below threshold = single-threaded
+- Above threshold = parallel
+
+**Tuning guide:**
+
+<Steps>
+  <Step title="Measure your batch sizes">
+    ```rust
+    let leaves = vec![...];
+    let parent_count = leaves.len().div_ceil(N);
+    println!("Parent count: {}", parent_count);
+    ```
+  </Step>
+  
+  <Step title="Set threshold based on workload">
+    - **Small batches (&lt;1000 leaves)**: `ROTORTREE_PARALLEL_THRESHOLD=4096`
+    - **Medium batches (1K-100K leaves)**: `ROTORTREE_PARALLEL_THRESHOLD=1024` (default)
+    - **Large batches (&gt;100K leaves)**: `ROTORTREE_PARALLEL_THRESHOLD=512`
+  </Step>
+  
+  <Step title="Benchmark and iterate">
+    ```bash
+    cargo bench --features parallel -- tree_bench_parallel
+    ```
+  </Step>
+</Steps>
+
+### Rayon Thread Pool
+
+Control parallelism explicitly:
+
+```rust
+rayon::ThreadPoolBuilder::new()
+    .num_threads(8)  // Limit to 8 threads
+    .stack_size(2 * 1024 * 1024)  // 2 MB stack per thread
+    .build_global()
+    .unwrap();
+
+// All insert_many calls now use max 8 threads
+let tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+tree.insert_many(&large_batch).unwrap();
+```
+
+<Note>
+Set the thread pool **before** creating any trees. It's a global configuration.
+</Note>
+
+## Tree Parameters
+
+### Branching Factor (N)
+
+Choose N based on your depth vs leaf-count tradeoff:
+
+<Tabs>
+  <Tab title="N=2 (Binary)">
+    ```rust
+    LeanIMT::<Blake3Hasher, 2, 20>::new(Blake3Hasher)
+    ```
+    
+    **Characteristics:**
+    - Deepest trees
+    - Smallest proofs (1 sibling per level)
+    - Slowest insertion (most levels to update)
+    - Best for: ZK circuits with size constraints
+  </Tab>
+  
+  <Tab title="N=4 (Quaternary)">
+    ```rust
+    LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher)
+    ```
+    
+    **Characteristics:**
+    - Balanced depth/proof-size tradeoff
+    - 2-3 siblings per level
+    - Good insertion performance
+    - Best for: Most use cases
+  </Tab>
+  
+  <Tab title="N=8 (Octal)">
+    ```rust
+    LeanIMT::<Blake3Hasher, 8, 16>::new(Blake3Hasher)
+    ```
+    
+    **Characteristics:**
+    - Shallow trees
+    - Larger proofs (up to 7 siblings per level)
+    - Fast insertion
+    - Best for: High throughput, proof size not critical
+  </Tab>
+  
+  <Tab title="N=16 (Hexadecimal)">
+    ```rust
+    LeanIMT::<Blake3Hasher, 16, 12>::new(Blake3Hasher)
+    ```
+    
+    **Characteristics:**
+    - Shallowest trees
+    - Largest proofs (up to 15 siblings per level)
+    - Fastest insertion
+    - Best for: Maximum throughput
+  </Tab>
+</Tabs>
+
+**Capacity comparison:**
+
+| N | MAX_DEPTH | Max Leaves | Typical Proof Size |
+|---|-----------|------------|--------------------|
+| 2 | 20 | ~1M | ~640 bytes |
+| 4 | 16 | ~4.3B | ~2 KB |
+| 8 | 10 | ~1B | ~2.5 KB |
+| 16 | 8 | ~4.3B | ~4 KB |
+
+<Note>
+**Recommendation:** Use N=4 for most workloads. It provides the best balance between insertion speed, proof size, and tree depth.
+</Note>
+
+### MAX_DEPTH
+
+Set based on expected leaf count:
+
+```rust
+// Example: 1 billion leaves with N=4
+let max_leaves = 4_u64.pow(MAX_DEPTH);
+let required_depth = (leaves as f64).log(4.0).ceil() as usize;
+
+// Add buffer for growth
+let safe_depth = required_depth + 2;
+```
+
+<Warning>
+Setting `MAX_DEPTH` too high wastes memory (allocates array of that size). Setting it too low causes insertion failures. Add 10-20% headroom.
+</Warning>
+
+## Storage Configuration
+
+### Flush Policy Tuning
+
+<Tabs>
+  <Tab title="High Throughput">
+    ```rust
+    FlushPolicy::Interval(Duration::from_millis(100))
+    ```
+    
+    Less frequent fsyncs = higher throughput, higher data loss risk (up to 100ms)
+  </Tab>
+  
+  <Tab title="Balanced">
+    ```rust
+    FlushPolicy::Interval(Duration::from_millis(10)) // Default
+    ```
+    
+    Good balance between durability and performance
+  </Tab>
+  
+  <Tab title="Strong Durability">
+    ```rust
+    FlushPolicy::Interval(Duration::from_millis(1))
+    ```
+    
+    Near-synchronous durability, moderate throughput impact
+  </Tab>
+  
+  <Tab title="Manual (Best Throughput)">
+    ```rust
+    FlushPolicy::Manual
+    ```
+    
+    Caller controls flushing. Best when following blockchain as canonical source:
+    
+    ```rust
+    // Process block
+    for tx in block.transactions {
+        tree.insert(tx.nullifier).unwrap();
+    }
+    
+    // Flush once per block
+    tree.flush().unwrap();
+    ```
+  </Tab>
+</Tabs>
+
+### Checkpoint Policy Tuning
+
+<Tabs>
+  <Tab title="Write-Heavy Workload">
+    ```rust
+    CheckpointPolicy::OnClose
+    ```
+    
+    **Effect:** Never checkpoint during operation, only on close
+    
+    **Pros:** Maximum write throughput, no checkpoint pauses
+    
+    **Cons:** Longer recovery time (must replay full WAL)
+  </Tab>
+  
+  <Tab title="Memory-Constrained">
+    ```rust
+    CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024) // 256 MB
+    ```
+    
+    **Effect:** Checkpoint when uncheckpointed memory exceeds 256 MB
+    
+    **Pros:** Bounded WAL size, predictable memory usage
+    
+    **Cons:** Checkpoint pauses when threshold hit
+  </Tab>
+  
+  <Tab title="Predictable Recovery">
+    ```rust
+    CheckpointPolicy::EveryNEntries(10_000)
+    ```
+    
+    **Effect:** Checkpoint after every 10K WAL entries
+    
+    **Pros:** Fast recovery (max 10K entries to replay)
+    
+    **Cons:** Frequent checkpoint pauses
+  </Tab>
+  
+  <Tab title="Manual Control">
+    ```rust
+    CheckpointPolicy::Manual
+    ```
+    
+    **Effect:** Caller controls via `tree.checkpoint()`
+    
+    **Example:** Checkpoint once per hour
+    ```rust
+    let mut last_checkpoint = Instant::now();
+    loop {
+        // Process insertions...
+        
+        if last_checkpoint.elapsed() > Duration::from_secs(3600) {
+            tree.checkpoint().unwrap();
+            last_checkpoint = Instant::now();
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Tiering Configuration
+
+Balance memory usage vs proof generation speed:
+
+<Tabs>
+  <Tab title="All Memory (Fastest Proofs)">
+    ```rust
+    TieringConfig { pin_above_level: 0 }
+    ```
+    
+    **Effect:** Keep all levels in memory
+    
+    **Memory:** ~1 GB per 100M leaves (with N=4)
+    
+    **Proof gen:** ~10-50 μs (constant)
+  </Tab>
+  
+  <Tab title="Balanced">
+    ```rust
+    TieringConfig { pin_above_level: 3 }
+    ```
+    
+    **Effect:** Mmap levels 0-2, keep 3+ in memory
+    
+    **Memory:** ~50 MB per 100M leaves
+    
+    **Proof gen:** ~50-200 μs (depends on page cache)
+  </Tab>
+  
+  <Tab title="Minimal Memory">
+    ```rust
+    TieringConfig::default() // pin_above_level: usize::MAX
+    ```
+    
+    **Effect:** Mmap all levels after checkpoint
+    
+    **Memory:** ~10 MB per 100M leaves
+    
+    **Proof gen:** ~100-500 μs (cold), ~50 μs (warm)
+  </Tab>
+</Tabs>
+
+<Note>
+With mmap, the OS page cache acts as a transparent cache. First proof access is slow (disk I/O), subsequent accesses are fast (page cache hit).
+</Note>
+
+## Benchmarking Your Workload
+
+RotorTree includes comprehensive benchmarks:
+
+```bash
+# List all benchmarks
+cargo bench -- --list
+
+# Run single-threaded benchmarks
+cargo bench --bench tree_bench
+
+# Run concurrent benchmarks
+cargo bench --features concurrent --bench tree_bench_concurrent
+
+# Run parallel benchmarks
+cargo bench --features parallel --bench tree_bench_parallel
+
+# Run storage benchmarks
+cargo bench --features storage --bench tree_bench_storage
+
+# Run all benchmarks (~380 total)
+cargo bench --features concurrent,parallel,storage
+```
+
+### Custom Benchmark Example
+
+```rust
+use divan::{Bencher, black_box};
+use rotortree::{LeanIMT, Blake3Hasher};
+
+#[divan::bench(args = [100, 1_000, 10_000, 100_000])]
+fn insert_many_bench(bencher: Bencher, batch_size: usize) {
+    let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+    
+    let leaves: Vec<[u8; 32]> = (0..batch_size)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h
+        })
+        .collect();
+    
+    bencher.bench_local(|| {
+        tree.insert_many(black_box(&leaves)).unwrap();
+    });
+}
+
+fn main() {
+    divan::main();
+}
+```
+
+Run with:
+
+```bash
+cargo bench --features parallel
+```
+
+## Optimization Checklist
+
+<Steps>
+  <Step title="Choose the right mode">
+    - In-memory only? → `LeanIMT` (no storage feature)
+    - Need persistence? → `RotorTree` (storage feature)
+    - Multiple threads? → Add `concurrent` feature
+    - Large batches? → Add `parallel` feature
+  </Step>
+  
+  <Step title="Select branching factor">
+    - Start with N=4 for most workloads
+    - Use N=2 only if proof size is critical (ZK circuits)
+    - Use N=8 or N=16 for maximum throughput
+  </Step>
+  
+  <Step title="Tune parallel threshold">
+    ```bash
+    export ROTORTREE_PARALLEL_THRESHOLD=1024  # Default
+    # Increase for smaller batches, decrease for larger
+    ```
+  </Step>
+  
+  <Step title="Configure storage policies">
+    - Write-heavy? → `CheckpointPolicy::OnClose`
+    - Memory-constrained? → `CheckpointPolicy::MemoryThreshold(...)`
+    - Fast recovery? → `CheckpointPolicy::EveryNEntries(...)`
+  </Step>
+  
+  <Step title="Optimize tiering">
+    - Fast proofs? → `TieringConfig { pin_above_level: 0 }`
+    - Low memory? → `TieringConfig::default()`
+  </Step>
+  
+  <Step title="Benchmark and measure">
+    ```bash
+    cargo bench --features parallel,storage
+    ```
+  </Step>
+</Steps>
+
+## Real-World Example: Bulk Loading
+
+From the repository's `bulk_load.rs` example:
+
+```rust
+use rotortree::{
+    Blake3Hasher, RotorTree, RotorTreeConfig,
+    FlushPolicy, CheckpointPolicy, TieringConfig,
+};
+use std::{env, path::PathBuf, time::{Duration, Instant}};
+
+const N: usize = 4;
+const MAX_DEPTH: usize = 14;
+
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn main() {
+    let total_leaves: u64 = env_or("TOTAL_LEAVES", 100_000_000);
+    let block_size: u64 = env_or("BLOCK_SIZE", 1_000_000);
+    
+    // Optimized for bulk loading
+    let config = RotorTreeConfig {
+        path: PathBuf::from(".db"),
+        flush_policy: FlushPolicy::Interval(Duration::from_millis(10)),
+        checkpoint_policy: CheckpointPolicy::MemoryThreshold(256 * 1024 * 1024),
+        tiering: TieringConfig::default(),
+        verify_checkpoint: false,  // Skip verification for speed
+    };
+    
+    let tree = RotorTree::<Blake3Hasher, N, MAX_DEPTH>::open(
+        Blake3Hasher,
+        config
+    ).unwrap();
+    
+    let mut inserted = 0u64;
+    
+    while inserted < total_leaves {
+        let this_block = block_size.min(total_leaves - inserted);
+        let leaves: Vec<[u8; 32]> = (inserted..inserted + this_block)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        
+        let block_start = Instant::now();
+        let (_root, token) = tree.insert_many(&leaves).unwrap();
+        let insert_time = block_start.elapsed();
+        
+        token.wait();
+        let durable_time = block_start.elapsed();
+        
+        inserted += this_block;
+        
+        let block_ins_per_sec = this_block as f64 / insert_time.as_secs_f64();
+        let durable_ins_per_sec = this_block as f64 / durable_time.as_secs_f64();
+        
+        println!(
+            "{} leaves: {:.0} inserts/sec, {:.0} durable/sec",
+            inserted, block_ins_per_sec, durable_ins_per_sec
+        );
+    }
+    
+    tree.close().unwrap();
+}
+```
+
+Run with:
+
+```bash
+export TOTAL_LEAVES=100000000
+export BLOCK_SIZE=1000000
+export ROTORTREE_PARALLEL_THRESHOLD=512
+
+cargo run --release --example bulk_load --features storage,parallel,blake3
+```
+
+## Performance Anti-Patterns
+
+<Warning>
+**Don't:**
+- Insert one leaf at a time in a loop (use `insert_many`)
+- Call `flush()` after every insert (use `FlushPolicy::Interval`)
+- Checkpoint too frequently (use `MemoryThreshold` or `OnClose`)
+- Use `concurrent` feature if you have single-threaded access
+- Set `ROTORTREE_PARALLEL_THRESHOLD` too low (increases overhead)
+- Verify checkpoint on every recovery in production
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Feature Flags" icon="flag" href="/guides/feature-flags">
+    Explore all available feature flags
+  </Card>
+  
+  <Card title="In-Memory Trees" icon="memory" href="/guides/in-memory-tree">
+    Learn about the fastest LeanIMT mode
+  </Card>
+  
+  <Card title="Persistent Storage" icon="database" href="/guides/persistent-storage">
+    Configure WAL and checkpointing
+  </Card>
+  
+  <Card title="Proof Generation" icon="shield-check" href="/guides/proof-generation">
+    Optimize proof generation performance
+  </Card>
+</CardGroup>

@@ -1,0 +1,149 @@
+---
+title: 'Hasher Trait'
+description: 'Core hash primitive trait supporting streaming operations'
+---
+
+## Overview
+
+The `Hasher` trait defines the interface for hash functions in RotorTree. It supports streaming hash operations through an associated `State` type.
+
+## Trait Definition
+
+```rust
+pub trait Hasher: Clone + Send + Sync + 'static {
+    type State: HashState;
+    
+    fn new_state(&self) -> Self::State;
+}
+```
+
+## Trait Bounds
+
+Implementors must satisfy:
+- `Clone` - Can be cloned cheaply
+- `Send` - Can be sent across threads
+- `Sync` - Can be shared across threads
+- `'static` - Contains no non-static references
+
+## Associated Types
+
+<ParamField path="State" type="HashState">
+  The streaming hash state type. Must implement the `HashState` trait.
+</ParamField>
+
+## Methods
+
+### new_state
+
+Create a fresh hashing state for streaming operations.
+
+```rust
+fn new_state(&self) -> Self::State
+```
+
+<ParamField path="returns" type="Self::State">
+  A new hash state ready to accept data via `update()`
+</ParamField>
+
+## HashState Trait
+
+The `HashState` trait defines the streaming interface:
+
+```rust
+pub trait HashState {
+    fn update(&mut self, data: &[u8]);
+    fn finalize(self) -> Hash;
+}
+```
+
+### update
+
+Feed bytes into the hash state.
+
+<ParamField path="data" type="&[u8]">
+  Bytes to hash
+</ParamField>
+
+### finalize
+
+Finalize the hash and return the digest. Consumes the state.
+
+<ParamField path="returns" type="Hash">
+  32-byte hash digest (`[u8; 32]`)
+</ParamField>
+
+## Implementing a Custom Hasher
+
+Here's how to implement `Hasher` for a custom hash function:
+
+```rust
+use rotortree::{Hash, HashState, Hasher};
+
+// 1. Define your hash state
+struct MyHashState {
+    // Your state fields
+}
+
+impl HashState for MyHashState {
+    fn update(&mut self, data: &[u8]) {
+        // Feed data into your hash
+    }
+    
+    fn finalize(self) -> Hash {
+        // Return the 32-byte digest
+        [0u8; 32]
+    }
+}
+
+// 2. Define your hasher
+#[derive(Clone)]
+struct MyHasher;
+
+impl Hasher for MyHasher {
+    type State = MyHashState;
+    
+    fn new_state(&self) -> Self::State {
+        MyHashState {
+            // Initialize state
+        }
+    }
+}
+```
+
+## Usage Example
+
+```rust
+use rotortree::{Hasher, Blake3Hasher};
+
+let hasher = Blake3Hasher::new();
+
+// Create a new streaming state
+let mut state = hasher.new_state();
+
+// Feed data in chunks
+state.update(b"hello ");
+state.update(b"world");
+
+// Get the final hash
+let hash = state.finalize();
+assert_eq!(hash.len(), 32);
+```
+
+## Related Types
+
+<CardGroup cols={2}>
+  <Card title="TreeHasher" icon="tree" href="/api/tree-hasher">
+    Domain-separated wrapper for Merkle tree operations
+  </Card>
+  <Card title="Blake3Hasher" icon="bolt" href="/api/blake3-hasher">
+    Built-in BLAKE3 implementation
+  </Card>
+</CardGroup>
+
+## Type Alias
+
+```rust
+pub type Hash = [u8; 32];
+```
+
+All hash functions in RotorTree produce 32-byte digests.

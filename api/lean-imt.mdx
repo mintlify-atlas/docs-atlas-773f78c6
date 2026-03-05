@@ -1,0 +1,260 @@
+---
+title: 'LeanIMT'
+description: 'Core N-ary lean incremental Merkle tree implementation'
+---
+
+## Type Definition
+
+```rust
+pub struct LeanIMT<H: Hasher, const N: usize, const MAX_DEPTH: usize>
+```
+
+An N-ary Lean Incremental Merkle Tree that supports efficient append-only operations with structural sharing.
+
+### Generic Parameters
+
+<ParamField path="H" type="Hasher" required>
+  Hash function implementing the `Hasher` trait
+</ParamField>
+
+<ParamField path="N" type="usize" required>
+  Branching factor (compile-time constant, must be ≥ 2)
+</ParamField>
+
+<ParamField path="MAX_DEPTH" type="usize" required>
+  Maximum tree depth (compile-time constant, must be ≥ 1)
+</ParamField>
+
+<Note>
+The branching factor `N` determines how many children each internal node can have. Common values are:
+- `N=2` for binary trees
+- `N=3` for ternary trees
+- `N=4` for quaternary trees
+</Note>
+
+## Constructor
+
+### new
+
+```rust
+pub fn new(hasher: H) -> Self
+```
+
+Creates a new empty tree with the given hasher.
+
+<ParamField path="hasher" type="H" required>
+  The hash function to use for computing internal nodes
+</ParamField>
+
+<ResponseField name="return" type="LeanIMT<H, N, MAX_DEPTH>">
+  A new empty tree instance
+</ResponseField>
+
+<CodeGroup>
+```rust Binary Tree
+use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+
+let tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
+```
+
+```rust Ternary Tree
+use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+
+let tree = LeanIMT::<Blake3Hasher, 3, 32>::new(Blake3Hasher);
+```
+</CodeGroup>
+
+## Methods
+
+### insert
+
+```rust
+// Without concurrent feature
+pub fn insert(&mut self, leaf: Hash) -> Result<Hash, TreeError>
+
+// With concurrent feature
+pub fn insert(&self, leaf: Hash) -> Result<Hash, TreeError>
+```
+
+Inserts a single leaf and returns the new Merkle root.
+
+<ParamField path="leaf" type="Hash" required>
+  The 32-byte hash to insert as a leaf
+</ParamField>
+
+<ResponseField name="return" type="Result<Hash, TreeError>">
+  The new Merkle root after insertion, or an error if the operation fails
+</ResponseField>
+
+**Errors:**
+- `TreeError::MaxDepthExceeded` if inserting would exceed `MAX_DEPTH`
+- `TreeError::CapacityExceeded` if the tree size would overflow `u64`
+
+```rust Example
+use rotortree::{LeanIMT, adapters::blake3::Blake3Hasher};
+
+let mut tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
+let leaf = [0u8; 32];
+let root = tree.insert(leaf)?;
+println!("New root: {:?}", root);
+```
+
+### insert_many
+
+```rust
+// Without concurrent feature
+pub fn insert_many(&mut self, leaves: &[Hash]) -> Result<Hash, TreeError>
+
+// With concurrent feature
+pub fn insert_many(&self, leaves: &[Hash]) -> Result<Hash, TreeError>
+```
+
+Inserts multiple leaves in a batch and returns the new root. More efficient than calling `insert` repeatedly.
+
+<ParamField path="leaves" type="&[Hash]" required>
+  Slice of 32-byte hashes to insert
+</ParamField>
+
+<ResponseField name="return" type="Result<Hash, TreeError>">
+  The new Merkle root after batch insertion
+</ResponseField>
+
+**Errors:**
+- `TreeError::EmptyBatch` if the slice is empty
+- `TreeError::MaxDepthExceeded` if the batch would exceed `MAX_DEPTH`
+- `TreeError::CapacityExceeded` if the tree size would overflow
+
+```rust Example
+let mut tree = LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher);
+let leaves = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+let root = tree.insert_many(&leaves)?;
+```
+
+<Info>
+With the `parallel` feature enabled, `insert_many` automatically parallelizes hash computation using Rayon when the batch size exceeds the configured threshold.
+</Info>
+
+### root
+
+```rust
+pub fn root(&self) -> Option<Hash>
+```
+
+Returns the current Merkle root, or `None` if the tree is empty.
+
+<ResponseField name="return" type="Option<Hash>">
+  The 32-byte root hash, or `None` for an empty tree
+</ResponseField>
+
+```rust Example
+let root = tree.root();
+if let Some(hash) = root {
+    println!("Root: {:?}", hash);
+} else {
+    println!("Tree is empty");
+}
+```
+
+### size
+
+```rust
+pub fn size(&self) -> u64
+```
+
+Returns the number of leaves in the tree.
+
+<ResponseField name="return" type="u64">
+  The leaf count
+</ResponseField>
+
+```rust Example
+let count = tree.size();
+println!("Tree has {} leaves", count);
+```
+
+### depth
+
+```rust
+pub fn depth(&self) -> usize
+```
+
+Returns the current depth (number of hash layers above the leaf level).
+
+<ResponseField name="return" type="usize">
+  The tree depth (0 for a single-leaf or empty tree)
+</ResponseField>
+
+```rust Example
+let d = tree.depth();
+println!("Tree depth: {}", d);
+```
+
+<Note>
+For an N-ary tree with `size` leaves, the depth is approximately `log_N(size)`. A single leaf has depth 0.
+</Note>
+
+### snapshot
+
+```rust
+pub fn snapshot(&self) -> TreeSnapshot<N, MAX_DEPTH>
+```
+
+Creates an immutable snapshot of the current tree state for lock-free proof generation.
+
+<ResponseField name="return" type="TreeSnapshot<N, MAX_DEPTH>">
+  An immutable snapshot that shares structure with the tree via `Arc`
+</ResponseField>
+
+```rust Example
+let snapshot = tree.snapshot();
+
+// The snapshot remains valid even if the tree is modified
+tree.insert([99u8; 32])?;
+
+// Snapshot still represents the old state
+let proof = snapshot.generate_proof(0)?;
+```
+
+<Info>
+Snapshots use structural sharing via `Arc`, making them very cheap to create. Multiple snapshots can coexist with minimal memory overhead.
+</Info>
+
+## Concurrency
+
+With the `concurrent` feature enabled:
+- `LeanIMT` wraps internal state in `parking_lot::RwLock`
+- All methods take `&self` instead of `&mut self`
+- Multiple threads can safely insert concurrently
+- Readers can take lock-free snapshots
+
+```rust Concurrent Example
+use std::sync::Arc;
+use std::thread;
+
+let tree = Arc::new(LeanIMT::<Blake3Hasher, 2, 32>::new(Blake3Hasher));
+
+let handles: Vec<_> = (0..4)
+    .map(|i| {
+        let tree = Arc::clone(&tree);
+        thread::spawn(move || {
+            tree.insert([i as u8; 32]).unwrap();
+        })
+    })
+    .collect();
+
+for h in handles {
+    h.join().unwrap();
+}
+
+println!("Final size: {}", tree.size());
+```
+
+## Memory Layout
+
+The tree uses a chunked storage format with structural sharing:
+- Leaf level and internal levels stored in 128-hash chunks
+- Chunks grouped into 256-chunk segments
+- Segments frozen into immutable `Arc` on completion
+- Snapshots share immutable segments with zero-copy
+
+See [Architecture](/concepts/architecture) for details.

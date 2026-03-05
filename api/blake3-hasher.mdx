@@ -1,0 +1,238 @@
+---
+title: 'Blake3Hasher'
+description: 'Built-in BLAKE3 hash function implementation'
+---
+
+## Overview
+
+`Blake3Hasher` is the built-in hash function for RotorTree, providing a high-performance implementation of the BLAKE3 cryptographic hash algorithm.
+
+BLAKE3 is:
+- **Fast** - Faster than MD5, SHA-1, SHA-2, and SHA-3
+- **Secure** - Cryptographically strong with 256-bit security
+- **Parallelizable** - Leverages SIMD instructions
+- **Standardized** - Based on the BLAKE family of hash functions
+
+## Type Definition
+
+```rust
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Blake3Hasher;
+```
+
+## Construction
+
+### new
+
+Create a new BLAKE3 hasher instance.
+
+```rust
+pub fn new() -> Self
+```
+
+<ParamField path="returns" type="Blake3Hasher">
+  A new BLAKE3 hasher
+</ParamField>
+
+**Example:**
+
+```rust
+use rotortree::Blake3Hasher;
+
+let hasher = Blake3Hasher::new();
+```
+
+### default
+
+Alternatively, use the `Default` trait:
+
+```rust
+let hasher = Blake3Hasher::default();
+```
+
+## Hasher Implementation
+
+`Blake3Hasher` implements the `Hasher` trait:
+
+```rust
+impl Hasher for Blake3Hasher {
+    type State = blake3::Hasher;
+    
+    fn new_state(&self) -> Self::State {
+        blake3::Hasher::new()
+    }
+}
+```
+
+### Associated Type
+
+<ParamField path="State" type="blake3::Hasher">
+  Uses the `blake3` crate's streaming hasher as the state type
+</ParamField>
+
+## HashState Implementation
+
+The `blake3::Hasher` type implements `HashState`:
+
+```rust
+impl HashState for blake3::Hasher {
+    fn update(&mut self, data: &[u8]) {
+        blake3::Hasher::update(self, data);
+    }
+    
+    fn finalize(self) -> Hash {
+        *blake3::Hasher::finalize(&self).as_bytes()
+    }
+}
+```
+
+## Usage Examples
+
+### Basic Hashing
+
+```rust
+use rotortree::{Blake3Hasher, Hasher};
+
+let hasher = Blake3Hasher::new();
+let mut state = hasher.new_state();
+
+state.update(b"hello world");
+let hash = state.finalize();
+
+assert_eq!(hash.len(), 32);
+```
+
+### Streaming Data
+
+```rust
+use rotortree::{Blake3Hasher, Hasher};
+
+let hasher = Blake3Hasher::new();
+let mut state = hasher.new_state();
+
+// Hash data in chunks
+for chunk in data.chunks(4096) {
+    state.update(chunk);
+}
+
+let final_hash = state.finalize();
+```
+
+### With TreeHasher
+
+```rust
+use rotortree::{TreeHasher, Blake3Hasher};
+
+// Wrap BLAKE3 for tree operations
+let tree_hasher = TreeHasher::new(Blake3Hasher::new());
+
+// Now has domain separation
+let leaf_hash = tree_hasher.hash_leaf(&some_hash);
+```
+
+### In a Tree
+
+```rust
+use rotortree::{Tree, TreeHasher, Blake3Hasher};
+
+let hasher = TreeHasher::new(Blake3Hasher::new());
+let mut tree = Tree::new(hasher, 4);
+
+// Tree uses BLAKE3 for all hash operations
+tree.insert(0, leaf_data)?;
+```
+
+## Performance Characteristics
+
+BLAKE3 provides:
+- **Throughput**: Up to 10+ GB/s on modern CPUs
+- **SIMD**: Uses AVX-512, AVX2, or SSE4.1 when available
+- **Small inputs**: Optimized for both small and large data
+- **Zero-copy**: Minimal allocations
+
+## Security Properties
+
+- **Collision resistance**: 256-bit security
+- **Preimage resistance**: 256-bit security  
+- **Second preimage resistance**: 256-bit security
+- **Length extension safe**: Not vulnerable to length extension attacks
+
+## Trait Implementations
+
+`Blake3Hasher` implements:
+- `Clone` - Zero-cost copy
+- `Copy` - Can be copied implicitly
+- `Debug` - Debug formatting
+- `Default` - Default construction
+- `Hasher` - Core hash trait
+- `Send` - Thread-safe to send
+- `Sync` - Thread-safe to share
+
+## Comparison with Other Hashers
+
+<CardGroup cols={2}>
+  <Card title="SHA-256" icon="lock">
+    Slower but more widely standardized. BLAKE3 is ~3-4x faster.
+  </Card>
+  <Card title="SHA-3" icon="shield">
+    Similar security, but BLAKE3 is significantly faster.
+  </Card>
+  <Card title="xxHash" icon="gauge">
+    Faster but non-cryptographic. Use BLAKE3 when security matters.
+  </Card>
+  <Card title="MD5/SHA-1" icon="triangle-exclamation">
+    Broken and insecure. Never use for new applications.
+  </Card>
+</CardGroup>
+
+## When to Use BLAKE3
+
+Use `Blake3Hasher` when you need:
+- Cryptographic security guarantees
+- High performance
+- Merkle tree integrity
+- Content addressing
+- Digital signatures
+
+## Implementing Custom Hashers
+
+If BLAKE3 doesn't meet your needs, you can implement a custom hasher:
+
+```rust
+use rotortree::{Hash, HashState, Hasher};
+
+#[derive(Clone)]
+struct MyHasher;
+
+impl Hasher for MyHasher {
+    type State = MyState;
+    
+    fn new_state(&self) -> Self::State {
+        // Your implementation
+    }
+}
+```
+
+See the [Hasher trait documentation](/api/hasher) for details.
+
+## Related Types
+
+<CardGroup cols={2}>
+  <Card title="Hasher" icon="function" href="/api/hasher">
+    Core hash trait interface
+  </Card>
+  <Card title="TreeHasher" icon="tree" href="/api/tree-hasher">
+    Domain-separated wrapper for trees
+  </Card>
+</CardGroup>
+
+## Dependencies
+
+BLAKE3 support requires the `blake3` crate:
+
+```toml
+[dependencies]
+blake3 = "1.5"
+```
+
+This is included by default in RotorTree.

@@ -1,0 +1,342 @@
+---
+title: Batch Operations
+description: Optimizing bulk insertions with insert_many and parallel processing
+---
+
+Batch operations are critical for high-throughput workloads. RotorTree's `insert_many` provides significant performance improvements over sequential inserts by amortizing tree traversal and enabling parallelization.
+
+## Basic Usage
+
+### In-Memory Trees
+
+```rust
+use rotortree::{LeanIMT, Blake3Hasher};
+
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Prepare a batch of leaves
+let leaves: Vec<[u8; 32]> = (0..1000)
+    .map(|i| {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&i.to_le_bytes());
+        h
+    })
+    .collect();
+
+// Insert all at once
+let root = tree.insert_many(&leaves).unwrap();
+```
+
+### Persistent Trees
+
+```rust
+use rotortree::{RotorTree, RotorTreeConfig, Blake3Hasher};
+use std::path::PathBuf;
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/tmp/my-tree"),
+    ..Default::default()
+};
+
+let tree = RotorTree::<Blake3Hasher, 4, 20>::open(Blake3Hasher, config).unwrap();
+
+let leaves = vec![[1u8; 32]; 500];
+
+// Returns root + durability token
+let (root, token) = tree.insert_many(&leaves).unwrap();
+
+// Wait for fsync to complete
+token.wait();
+```
+
+## Performance Characteristics
+
+### Sequential vs Batch
+
+**Sequential insertion (1000 leaves):**
+```rust
+for leaf in leaves {
+    tree.insert(leaf)?; // ❌ Slow: 1000 separate tree updates
+}
+```
+
+**Batch insertion (1000 leaves):**
+```rust
+tree.insert_many(&leaves)?; // ✅ Fast: Single tree update
+```
+
+### Why Batch is Faster
+
+1. **Level-by-level processing**: Computes all nodes at each level in one pass
+2. **Reduced traversals**: One upward pass instead of N passes
+3. **Better cache locality**: Sequential access to chunk data
+4. **Parallelization opportunity**: Can hash nodes in parallel (with `parallel` feature)
+5. **Amortized Arc cloning**: Fewer copy-on-write operations
+
+<Tip>
+From the README: The pure in-memory benchmark achieves **up to ~190M leaves/sec** with batch operations and the `parallel` feature.
+</Tip>
+
+## Parallel Batch Processing
+
+Enable the `parallel` feature to use Rayon-based parallelization:
+
+```toml
+[dependencies]
+rotortree = { version = "*", features = ["parallel"] }
+```
+
+### How It Works
+
+When computing parent nodes during `insert_many`, the tree:
+
+1. Counts the number of parent nodes needed at each level
+2. If `num_parents >= ROTORTREE_PARALLEL_THRESHOLD`, uses Rayon
+3. Splits parent computation into chunks of size `PAR_CHUNK_SIZE`
+4. Processes chunks across multiple threads
+
+### Parallel Threshold
+
+Control when parallelization kicks in:
+
+```bash
+# Default: parallelize when 1024+ parent nodes
+export ROTORTREE_PARALLEL_THRESHOLD=1024
+
+# More aggressive parallelization
+export ROTORTREE_PARALLEL_THRESHOLD=512
+
+# Conservative (only very large batches)
+export ROTORTREE_PARALLEL_THRESHOLD=4096
+```
+
+**Tuning guidance:**
+- **Small batches (< 1000 leaves)**: Use higher threshold or disable parallel
+- **Large batches (> 10,000 leaves)**: Use lower threshold
+- **Many CPU cores**: Lower threshold for better utilization
+- **Latency-sensitive**: Higher threshold for lower variance
+
+<Note>
+Sequential processing often has **better variance** characteristics, trading peak throughput for predictable latency.
+</Note>
+
+## PAR_CHUNK_SIZE Impact
+
+The `PAR_CHUNK_SIZE` constant (default: 64) controls work distribution:
+
+```rust
+const PAR_CHUNK_SIZE: usize = 64; // Parents per Rayon task
+```
+
+**Effect on parallelization:**
+
+| PAR_CHUNK_SIZE | Parallelism | Overhead | Best For |
+|----------------|-------------|----------|----------|
+| 16 | High | High | 32+ cores, huge batches |
+| 64 | Moderate | Moderate | 8-16 cores, typical workloads |
+| 256 | Low | Low | 4-8 cores, smaller batches |
+
+<Warning>
+Changing `PAR_CHUNK_SIZE` requires modifying the source and recompiling. See [Configuration](/optimization/configuration).
+</Warning>
+
+## Batch Sizing Strategies
+
+### Optimal Batch Size
+
+The optimal batch size depends on your configuration:
+
+```rust
+// For N=4, good batch sizes that align with tree structure:
+let batch_sizes = [256, 1024, 4096, 16384, 65536];
+//                  4^4  4^5   4^6   4^7    4^8
+```
+
+**Why powers of N?**
+- Fills complete levels
+- Minimizes partial nodes
+- Better parallelization
+- Cleaner structural sharing
+
+### Incremental Batching
+
+You can mix single inserts and batches:
+
+```rust
+let mut tree = LeanIMT::<Blake3Hasher, 4, 20>::new(Blake3Hasher);
+
+// Initial bulk load
+tree.insert_many(&initial_leaves)?;
+
+// Incremental updates
+for leaf in stream {
+    tree.insert(leaf)?;
+}
+
+// Periodic bulk updates
+if buffer.len() >= 1000 {
+    tree.insert_many(&buffer)?;
+    buffer.clear();
+}
+```
+
+### Maximum Batch Size
+
+With the `storage` feature, batch size is limited by `MAX_FRAME_PAYLOAD`:
+
+```rust
+const MAX_FRAME_PAYLOAD: u32 = 128 * 1024 * 1024; // 128 MB
+
+// Maximum leaves per batch:
+let max_leaves = MAX_FRAME_PAYLOAD / 32; // 4,194,304 leaves
+```
+
+<Warning>
+Attempting to insert more than ~4.2M leaves in a single batch will fail with a panic. Split large batches if needed.
+</Warning>
+
+## Memory Usage
+
+### Batch Processing Memory
+
+```rust
+// Memory required for a batch:
+// - Input leaves: batch_size × 32 bytes
+// - Level 0 storage: batch_size × 32 bytes  
+// - Parent buffers: batch_size / N × 32 bytes per level
+// - Parallel work buffer: (batch_size / N) × 32 bytes
+
+// Example for 1M leaves with N=4:
+// Input:    1,000,000 × 32 = 32 MB
+// Level 0:  1,000,000 × 32 = 32 MB
+// Parents:    250,000 × 32 = 8 MB per level × ~10 levels = 80 MB
+// Total:                     ~144 MB
+```
+
+### Structural Sharing
+
+Batch operations benefit from chunk-based structural sharing:
+
+```rust
+const CHUNK_SIZE: usize = 128;
+const CHUNKS_PER_SEGMENT: usize = 256;
+
+// A segment: 256 × 128 × 32 = 1 MB
+// Shared via Arc between tree and snapshots
+```
+
+Large batches that fill complete segments enable efficient Arc sharing without copying data.
+
+## Error Handling
+
+```rust
+use rotortree::TreeError;
+
+match tree.insert_many(&leaves) {
+    Ok(root) => println!("Inserted {} leaves", leaves.len()),
+    Err(TreeError::EmptyBatch) => {
+        // Cannot insert empty batch
+    }
+    Err(TreeError::MaxDepthExceeded { max_depth }) => {
+        // Tree capacity exceeded
+    }
+    Err(TreeError::CapacityExceeded) => {
+        // Usize overflow (rare on 64-bit)
+    }
+    Err(e) => panic!("Unexpected error: {:?}", e),
+}
+```
+
+<Note>
+`insert_many` with an empty slice returns `TreeError::EmptyBatch`.
+</Note>
+
+## Benchmarking Batches
+
+```bash
+# Run batch benchmarks
+cargo bench --bench tree_bench
+
+# With parallel feature
+cargo bench --bench tree_bench_parallel --features parallel
+
+# Specific batch sizes
+cargo bench --bench tree_bench -- insert_many_1000
+cargo bench --bench tree_bench -- insert_many_10000
+```
+
+View comprehensive benchmark results at: https://rymnc.github.io/rotortree/benchmarks
+
+## Real-World Example: Blockchain Sync
+
+```rust
+use rotortree::{RotorTree, RotorTreeConfig, Blake3Hasher};
+
+const BATCH_SIZE: usize = 10_000;
+
+let config = RotorTreeConfig {
+    path: PathBuf::from("/data/nullifiers"),
+    flush_policy: FlushPolicy::Manual,
+    checkpoint_policy: CheckpointPolicy::EveryNEntries(1_000_000),
+    ..Default::default()
+};
+
+let tree = RotorTree::<Blake3Hasher, 8, 12>::open(Blake3Hasher, config)?;
+
+let mut buffer = Vec::with_capacity(BATCH_SIZE);
+
+for block in blockchain.blocks() {
+    for nullifier in block.nullifiers() {
+        buffer.push(nullifier);
+        
+        if buffer.len() >= BATCH_SIZE {
+            // Bulk insert
+            tree.insert_many(&buffer)?;
+            buffer.clear();
+            
+            // Manual flush at block boundaries
+            tree.flush()?;
+        }
+    }
+}
+
+// Don't forget remaining items
+if !buffer.is_empty() {
+    tree.insert_many(&buffer)?;
+    tree.flush()?;
+}
+```
+
+## Best Practices
+
+<Card title="Do" icon="check">
+  - Use `insert_many` for 100+ leaves
+  - Align batch sizes with powers of N
+  - Enable `parallel` feature for large batches (10K+ leaves)
+  - Tune `ROTORTREE_PARALLEL_THRESHOLD` for your workload
+  - Buffer incremental inserts and flush periodically
+</Card>
+
+<Card title="Don't" icon="xmark">
+  - Insert leaves one at a time in a loop
+  - Use tiny batches (< 10 leaves)
+  - Exceed MAX_FRAME_PAYLOAD size with storage
+  - Assume parallel is always faster (measure variance)
+  - Forget to flush or wait for durability tokens
+</Card>
+
+## Feature Combinations
+
+| Features | Best For | Batch Strategy |
+|----------|----------|----------------|
+| Default | Small trees, in-memory | 100-1000 leaf batches |
+| `parallel` | High throughput | 10K+ leaf batches, lower threshold |
+| `concurrent` | Multi-threaded access | Coordinate batch sizes across threads |
+| `storage` | Persistent trees | Batch + checkpoint alignment |
+| `storage` + `parallel` | High-throughput database | Large batches with manual checkpoints |
+
+## Related Topics
+
+- [Configuration](/optimization/configuration) - Tuning PAR_CHUNK_SIZE and thresholds
+- [Branching Factor](/optimization/branching-factor) - Choosing N for optimal batch performance
+- [Storage Layer](/guides/persistent-storage) - Persisting batch operations
